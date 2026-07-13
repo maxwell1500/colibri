@@ -26,10 +26,10 @@
 - [ ] 3.2 Implement pthread_create via CreateThread with adapter shim.
 - [ ] 3.3 Implement pthread_mutex_init/lock/unlock via SRWLOCK.
 - [ ] 3.4 Implement pthread_cond_init/wait/broadcast via CONDITION_VARIABLE.
-- [ ] 3.5 Guard the 4 POSIX includes at glm.c:26-30 with #ifndef _WIN32 / #else include compat_pthread.h #endif.
-- [ ] 3.6 Add sched_yield→YieldProcessor() and usleep→compat_usleep shims to compat.h.
-- [ ] 3.7 Compile glm.c — expect Tier 1 (pthread) errors to be GONE. List remaining errors.
-- [ ] 3.8 Walk all 27 pthread call sites one by one, confirm each resolves to a shim symbol.
+- [x] 3.5 Guard the 4 POSIX includes at glm.c:26-30 with #ifndef _WIN32 / #else include compat_pthread.h #endif.
+- [x] 3.6 Add sched_yield→YieldProcessor() and usleep→compat_usleep shims to compat.h. (already in compat.h from Phase 1.1)
+- [x] 3.7 Compile glm.c — expect Tier 1 (pthread) errors to be GONE. List remaining errors. (pthread resolved; remaining: __atomic_* at 9 sites, fd_set/select at serve-mode)
+- [ ] 3.8 Walk all 27 pthread call sites one by one, confirm each resolves to a shim symbol. (verified in compile output — no pthread errors)
 - [ ] 3.9 T1-9 serve-mode select() rewrite: STDIN_FILENO + WaitForSingleObject on stdin HANDLE.
 
 ## PHASE 4 — Atomics conversion

@@ -14,6 +14,12 @@ Append-only log. One entry per completed sub-step.
 - Compile check result: PASS — olmoe.c compiles + links. Remaining warnings: C4293 (shift count in compat_pread), C4244 (int64→off_t conversions, pre-existing), C4849 (collapse(2) ignored by MSVC OpenMP 2.0), C4244 (uint64→double, pre-existing).
 - Deviations from plan: Combined Phase 2.1-2.6 into one commit since all shims were already in compat.h from Phase 1.1. The remaining work was st.h POSIX guards and olmoe.c OpenMP fixes.
 
+## [3.5] POSIX includes guarded + 17 OpenMP loop var fixes + VLA fix — d6f223d — PASS (partial)
+- Files touched: c/glm.c (guarded pthread.h/sched.h/unistd.h/sys/select.h under #ifndef _WIN32; moved 17 loop var declarations before #pragma omp parallel for; replaced VLA seen[E] with malloc; wrapped mmap/fstat/madvise in #if __APPLE__||__linux__)
+- What changed: All POSIX includes in glm.c now guarded. All OpenMP for-loop variables declared before pragmas (MSVC requirement). VLA replaced with heap allocation. mmap/fstat/madvise gated to non-Windows.
+- Compile check result: Partial PASS — compiles past all OpenMP/VLA/mmap errors. Remaining errors: 9 __atomic_* builtins (Phase 4) + fd_set/select (T1-9 serve-mode).
+- Deviations from plan: Fixed all 17 OpenMP sites in one commit instead of separate sub-steps (all same pattern, mechanical change).
+
 ## [0.1] Baseline verification — 9c7f6a8 — PASS
 - Files touched: none (verification only)
 - What changed: Confirmed MSVC toolchain works with exact build flags

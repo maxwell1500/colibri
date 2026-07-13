@@ -170,7 +170,7 @@ typedef struct {
     float *hlast, *h_all;                        /* hidden pre-norm: ultima pos / tutte le pos batch */
     uint64_t mtp_prop, mtp_acc;                  /* statistica acceptance */
     int **eroute; int *enr;                      /* metodo C: routing dell'ULTIMO token per layer */
-    uint64_t eclock, hits, miss, ereq;
+    _Atomic uint64_t eclock; uint64_t hits, miss, ereq;
     uint64_t gpu_expert_calls; int gpu_expert_count; int64_t gpu_expert_bytes;
     uint64_t n_fw, n_emit;                       /* metodo E: forward di decode / token emessi */
     double t_edisk, t_ewait, t_emm, t_attn, t_kvb, t_head;/* profiling: dove va il tempo */
@@ -1762,7 +1762,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
             ESlot *P=m->pin[layer];
             for(int z=0;z<m->npin[layer];z++) if(P[z].eid==eid){ m->hits++; use[j]=&P[z]; break; }
             if(!use[j]){ ESlot *Sl=m->ecache[layer]; int nn=m->ecn[layer];
-                for(int z=0;z<nn;z++) if(Sl[z].eid==eid){ m->hits++; Sl[z].used=(uint64_t)__atomic_add_fetch(&m->eclock,1,__ATOMIC_RELAXED); use[j]=&Sl[z]; break; } }
+                for(int z=0;z<nn;z++) if(Sl[z].eid==eid){ m->hits++; Sl[z].used=(uint64_t)atomic_fetch_add_explicit(&m->eclock,1,memory_order_relaxed); use[j]=&Sl[z]; break; } }
             if(!use[j]){ qof[j]=nmiss; use[j]=&m->ws[nmiss]; missk[nmiss++]=j; m->miss++; }
         }
         int metal_done=0;
@@ -1983,7 +1983,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
           for(int a=0;a<promo;a++){ int q=nmiss-1-a; ESlot *dst;
               if(*nn<m->ecap) dst=&Sl[(*nn)++];
               else { int lru=0; for(int z=1;z<*nn;z++) if(Sl[z].used<Sl[lru].used) lru=z; dst=&Sl[lru]; }
-              ESlot tmp=*dst; *dst=m->ws[q]; m->ws[q]=tmp; dst->used=(uint64_t)__atomic_add_fetch(&m->eclock,1,__ATOMIC_RELAXED); }
+               ESlot tmp=*dst; *dst=m->ws[q]; m->ws[q]=tmp; dst->used=(uint64_t)atomic_fetch_add_explicit(&m->eclock,1,memory_order_relaxed); }
         }
     }
     /* ---- FASE E: shared expert, un matmul a S righe (skipped se fuso nel blocco GPU) ---- */
@@ -2045,7 +2045,7 @@ static void la_predict(Model *m, int target, const float *h, int kind){
  * il pilota costava piu' di quanto rendesse. Ring lock-free 1P/1C; pieno = scarta
  * (un hint perso non e' un errore). */
 static struct { int l,e; } pilot_q[4096];
-static volatile unsigned pilot_w=0, pilot_r=0;
+static _Atomic unsigned pilot_w=0, pilot_r=0;
 static Model *pilot_m=NULL;
 /* PILOT_REAL: load VERO dell'expert predetto dentro la LRU del layer FUTURO. Vedi
  * l'invariante di sicurezza accanto a g_pilot_real. Il pread (lento) gira FUORI dal lock;
@@ -2072,7 +2072,7 @@ static void pilot_realload(Model *m, int layer, int eid){
 
     pthread_mutex_lock(&g_pilot_mx);
     if(rc==0){
-        dst->used=(uint64_t)__atomic_add_fetch(&m->eclock,1,__ATOMIC_RELAXED);
+        dst->used=(uint64_t)atomic_fetch_add_explicit(&m->eclock,1,memory_order_relaxed);
         if(isnew) m->ecn[layer]=slot+1;                 /* pubblica lo slot SOLO ora che eid e' valido */
         atomic_fetch_add_explicit(&g_pilot_loads,1,memory_order_relaxed);
     } else {
@@ -2086,12 +2086,12 @@ static void pilot_realload(Model *m, int layer, int eid){
 static void *pilot_worker(void *arg){
     (void)arg;
     for(;;){
-        unsigned r=__atomic_load_n(&pilot_r,__ATOMIC_ACQUIRE);
-        unsigned w=__atomic_load_n(&pilot_w,__ATOMIC_ACQUIRE);
+        unsigned r=atomic_load_explicit(&pilot_r,memory_order_acquire);
+        unsigned w=atomic_load_explicit(&pilot_w,memory_order_acquire);
         if(r==w){ usleep(200); continue; }
         if(g_pilot_real) pilot_realload(pilot_m, pilot_q[r&4095].l, pilot_q[r&4095].e);
         else             expert_prefetch(pilot_m, pilot_q[r&4095].l, pilot_q[r&4095].e);
-        __atomic_store_n(&pilot_r,r+1,__ATOMIC_RELEASE);
+        atomic_store_explicit(&pilot_r,r+1,memory_order_release);
     }
     return NULL;
 }
@@ -2122,10 +2122,10 @@ static void pilot_prefetch(Model *m, int lnext, const float *x, int S){
             for(int z=0;z<m->ecn[lnext] && !found;z++) if(Sl[z].eid==best) found=1;
             pthread_mutex_unlock(&g_pilot_mx);
             if(!found){
-                unsigned w=__atomic_load_n(&pilot_w,__ATOMIC_RELAXED);
-                if(w-__atomic_load_n(&pilot_r,__ATOMIC_ACQUIRE)<4096){
+                unsigned w=atomic_load_explicit(&pilot_w,memory_order_relaxed);
+                if(w-atomic_load_explicit(&pilot_r,memory_order_acquire)<4096){
                     pilot_q[w&4095].l=lnext; pilot_q[w&4095].e=best;
-                    __atomic_store_n(&pilot_w,w+1,__ATOMIC_RELEASE);
+                    atomic_store_explicit(&pilot_w,w+1,memory_order_release);
                 }
             }
         }
@@ -3062,10 +3062,15 @@ static void run_serve_mux(Model *m, const char *snap){
     int eof=0;
     for(;;){
         int active=0; for(int i=0;i<nctx;i++) active+=req[i].active;
+#ifdef _WIN32
+        HANDLE hIn=(HANDLE)_get_osfhandle(_fileno(stdin));
+        int ready=eof?0:(WaitForSingleObject(hIn,active?0:INFINITE)==WAIT_OBJECT_0);
+#else
         fd_set rfds; FD_ZERO(&rfds); FD_SET(STDIN_FILENO,&rfds);
         struct timeval tv={0,0}, *ptv=active?&tv:NULL;
         int ready=eof?0:select(STDIN_FILENO+1,&rfds,NULL,NULL,ptv);
-        if(ready>0 && FD_ISSET(STDIN_FILENO,&rfds)) if(mux_submit(m,&T,ctx,req,nctx,maxctx,eos)<0) eof=1;
+#endif
+        if(ready && mux_submit(m,&T,ctx,req,nctx,maxctx,eos)<0) eof=1;
         active=0; for(int i=0;i<nctx;i++) active+=req[i].active;
         if(!active){ if(eof) break; continue; }
         DecodeRow rows[16]; int slots[16], S=0;
