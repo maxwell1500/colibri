@@ -2886,7 +2886,13 @@ static void kv_disk_append(Model *m, const int *hist, int len){
         int32_t h[8]; kv_hdr(m,h,0); fwrite(KV_MAGIC,1,8,f); fwrite(h,4,8,f); }
     int64_t rec = 4 + (int64_t)c->n_layers*(c->kv_lora+c->qk_rope)*4;
     if(m->has_dsa) for(int i=0;i<c->n_layers;i++) if(m->Ic[i]) rec+=(int64_t)c->index_hd*4;
-    fseek(f, 8+8*4 + (int64_t)k->disk_nrec*rec, SEEK_SET);
+    { int64_t pos = 8+8*4 + (int64_t)k->disk_nrec*rec;
+#ifdef _WIN32
+      _fseeki64(f, pos, SEEK_SET);   /* fseek takes 32-bit long on MSVC/LLP64 */
+#else
+      fseek(f, pos, SEEK_SET);
+#endif
+    }
     for(int p=k->disk_nrec;p<len;p++){
         int32_t tk=hist[p]; fwrite(&tk,4,1,f);
         for(int i=0;i<c->n_layers;i++){

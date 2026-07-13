@@ -73,9 +73,10 @@ static inline int compat_open_direct(const char *path){
 #define _CRT_SECURE_NO_WARNINGS
 #endif
 
-/* Belt-and-braces: 64-bit off_t mandatory — model is 370 GB, every pread
- * region can exceed 2 GB. 32-bit off_t silently wraps >4 GB offsets into the
- * first 4 GB → reads wrong weight bytes → silent token corruption. */
+/* NOTE: _FILE_OFFSET_BITS=64 is a GCC/glibc concept — MSVC ignores it and
+ * keeps off_t as `long` (32-bit under LLP64). We require it in CFLAGS anyway
+ * for documentation, but the REAL 64-bit safety comes from compat_pread using
+ * int64_t directly (not off_t). See the comment on compat_pread. */
 #if !defined(_FILE_OFFSET_BITS) || _FILE_OFFSET_BITS < 64
 #error "_FILE_OFFSET_BITS=64 required on Windows (add -D_FILE_OFFSET_BITS=64 to CFLAGS)"
 #endif
@@ -121,8 +122,11 @@ typedef SSIZE_T ssize_t;
 /* --- pread -> ReadFile + OVERLAPPED su raw OS handle ---
  * Thread-safe (no shared seek position). Gestisce offset >4 GB e chunking
  * per letture >2 GB (anche se i tensori individuali sono nell'ordine dei
- * MB-centinaia di MB, il wrapper e' robusto per ogni taglia). */
-static inline ssize_t compat_pread(int fd, void *buf, size_t n, off_t off){
+ * MB-centinaia di MB, il wrapper e' robusto per ogni taglia).
+ * ATTN: usa int64_t, NON off_t — MSVC's off_t e' long (32-bit su Win64/LLP64),
+ * _FILE_OFFSET_BITS=64 e' ignorato da MSVC. Passare off_t qui troncherebbe
+ * ogni offset >2GB a 32 bit → letture dal offset sbagliato → pesi corrotti. */
+static inline ssize_t compat_pread(int fd, void *buf, size_t n, int64_t off){
     intptr_t osfh = _get_osfhandle(fd);
     if(osfh == -1 || osfh == -2){ errno = EBADF; return -1; }
     HANDLE h = (HANDLE)osfh;
@@ -131,8 +135,9 @@ static inline ssize_t compat_pread(int fd, void *buf, size_t n, off_t off){
         size_t chunk = n - total;
         DWORD chunk32 = (chunk > 0x7FFFFFFF) ? 0x7FFFFFFF : (DWORD)chunk;
         OVERLAPPED ov = {0};
-        ov.Offset     = (DWORD)( (off + (off_t)total)        & 0xFFFFFFFFULL);
-        ov.OffsetHigh = (DWORD)(((off + (off_t)total) >> 32) & 0xFFFFFFFFULL);
+        int64_t absoff = off + (int64_t)total;
+        ov.Offset     = (DWORD)( absoff        & 0xFFFFFFFFULL);
+        ov.OffsetHigh = (DWORD)((absoff >> 32) & 0xFFFFFFFFULL);
         DWORD rd = 0;
         if(!ReadFile(h, (char*)buf + total, chunk32, &rd, &ov)){
             DWORD err = GetLastError();
@@ -267,6 +272,18 @@ static inline void compat_usleep(unsigned long usecs){
 #define strdup _strdup
 #endif
 
+/* --- fseeko -> _fseeki64 (64-bit file offset) ---
+ * MSVC's fseek takes `long` (32-bit on LLP64). _fseeki64 takes __int64.
+ * Code that needs >2GB offsets should call fseeko() instead of fseek(). */
+#if !defined(fseeko) && !defined(__APPLE__)
+#define fseeko _fseeki64
+#endif
+
+/* --- ftello -> _ftelli64 (64-bit file position) --- */
+#if !defined(ftello) && !defined(__APPLE__)
+#define ftello _ftelli64
+#endif
+
 /* --- lseek -> _lseeki64 --- */
 #ifndef lseek
 #define lseek _lseeki64
@@ -278,14 +295,16 @@ static inline void compat_usleep(unsigned long usecs){
 #endif
 
 /* --- dirent.h shim: opendir/readdir/closedir via FindFirstFileA/FindNextFileA --- */
+struct dirent {
+    char d_name[MAX_PATH];
+};
 typedef struct {
     HANDLE h;
     WIN32_FIND_DATAA fd;
     int first_done;
+    struct dirent ent;   /* returned by readdir (no malloc — matches POSIX semantics) */
 } compat_DIR;
 typedef compat_DIR DIR;
-typedef struct compat_dirent { char d_name[MAX_PATH]; } compat_dirent;
-#define dirent compat_dirent
 
 static inline DIR* compat_opendir(const char *name){
     compat_DIR *d = (compat_DIR*)malloc(sizeof(*d));
@@ -310,10 +329,8 @@ static inline struct dirent* compat_readdir(DIR *dir){
     } else {
         if(!FindNextFileA(d->h, &d->fd)) return NULL;
     }
-    struct dirent *e = (struct dirent*)malloc(sizeof(struct dirent));
-    if(!e) return NULL;
-    strncpy_s(e->d_name, MAX_PATH, d->fd.cFileName, _TRUNCATE);
-    return e;
+    strncpy_s(d->ent.d_name, MAX_PATH, d->fd.cFileName, _TRUNCATE);
+    return &d->ent;
 }
 
 static inline int compat_closedir(DIR *dir){

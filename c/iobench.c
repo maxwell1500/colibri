@@ -26,11 +26,11 @@ int main(int argc,char**argv){
     int nth=argc>4?atoi(argv[4]):8;
     int direct=argc>5?atoi(argv[5]):1;
 #ifdef O_DIRECT
-    int fd=open(argv[1],O_RDONLY|(direct?O_DIRECT:0));
+    int fd=open(argv[1],COMPAT_O_RDONLY|(direct?O_DIRECT:0));
     if(fd<0 && direct){ fprintf(stderr,"O_DIRECT is unavailable (%s); using buffered I/O\n",strerror(errno));
-        direct=0; fd=open(argv[1],O_RDONLY); }
+        direct=0; fd=open(argv[1],COMPAT_O_RDONLY); }
 #else
-    int fd=open(argv[1],O_RDONLY);                 /* macOS: F_NOCACHE ~ O_DIRECT */
+    int fd=open(argv[1],COMPAT_O_RDONLY);                 /* macOS: F_NOCACHE ~ O_DIRECT */
 #ifdef __APPLE__
     if(direct && fd>=0) fcntl(fd,F_NOCACHE,1);
 #else
@@ -38,13 +38,13 @@ int main(int argc,char**argv){
 #endif
 #endif
     if(fd<0){perror("open");return 1;}
-    off_t sz=lseek(fd,0,SEEK_END);
+    int64_t sz=lseek(fd,0,SEEK_END);
     if(sz<blk*2){fprintf(stderr,"file is too small\n");return 1;}
     /* offset random pre-generati (stessi per ogni configurazione: srand fisso).
      * 30 bit di rand combinati: su Windows RAND_MAX=32767 e un singolo rand()*4096
      * copre solo i primi 134 MB del file (tutti in page cache = misura falsa). */
-    off_t *offs=malloc(n*sizeof(off_t)); srand(1234);
-    for(int i=0;i<n;i++){ off_t r30=((off_t)rand()<<15)|rand(); off_t o=(r30*4096)%(sz-blk); offs[i]=o&~4095L; }
+    int64_t *offs=malloc(n*sizeof(int64_t)); srand(1234);
+    for(int i=0;i<n;i++){ int64_t r30=((int64_t)rand()<<15)|rand(); int64_t o=(r30*4096)%(sz-blk); offs[i]=o&~((int64_t)4095); }
     double t0=now(); int64_t tot=0;   /* long e' 32-bit su Windows (LLP64): >2GB andava in overflow */
     #pragma omp parallel num_threads(nth) reduction(+:tot)
     {
