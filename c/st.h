@@ -12,8 +12,10 @@
 #include <string.h>
 #include <stdint.h>
 #include <fcntl.h>
+#ifndef _WIN32
 #include <unistd.h>
 #include <dirent.h>
+#endif
 #include "json.h"
 #include "compat.h"
 

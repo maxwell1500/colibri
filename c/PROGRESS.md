@@ -2,6 +2,12 @@
 
 Append-only log. One entry per completed sub-step.
 
+## [1.1] clock_gettime shim + POSIX include guards — dd33d5e — PASS
+- Files touched: c/compat.h (added clock_gettime, sched_yield, usleep, strdup, lseek, STDIN_FILENO, dirent shims; added ssize_t, off_t, _CRT_SECURE_NO_WARNINGS), c/iobench.c (guarded unistd.h include, moved OpenMP loop var before pragma)
+- What changed: Added QueryPerformanceCounter-based clock_gettime shim. Guarded #include <unistd.h> in iobench.c. Fixed MSVC OpenMP 2.0 requirement (loop var declared before #pragma omp for). Added _CRT_SECURE_NO_WARNINGS + #pragma warning(disable:4996).
+- Compile check result: PASS — iobench.c compiles + links, binary runs (prints usage, no crash)
+- Deviations from plan: Combined multiple shims into one step (clock_gettime, lseek, strdup, sched_yield, usleep, dirent, STDIN_FILENO, ssize_t, off_t) since they all fit in compat.h and iobench.c was the simplest test file. Also fixed OpenMP loop var declaration which is a MSVC-specific requirement.
+
 ## [0.1] Baseline verification — 9c7f6a8 — PASS
 - Files touched: none (verification only)
 - What changed: Confirmed MSVC toolchain works with exact build flags

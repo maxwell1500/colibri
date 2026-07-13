@@ -8,10 +8,10 @@
 - [x] 0.4 Set up MSVC toolchain invocation. Create build_msvc.bat with the vcvars64 call + cl invocation. Smoke-test by compiling an empty .c file. Record exact command in ARCHITECTURE.md.
 
 ## PHASE 1 — iobench.c (simplest file, validates toolchain end-to-end)
-- [ ] 1.1 Add clock_gettime/CLOCK_MONOTONIC shim to compat.h (QueryPerformanceCounter-based). Wire in iobench.c:19 only.
-- [ ] 1.2 Add lseek → _lseeki64 shim to compat.h. Wire into iobench.c:39.
-- [ ] 1.3 Confirm iobench.c's reduction(+:tot) OpenMP clause compiles under /openmp (verification step).
-- [ ] 1.4 Full compile + link of iobench.c under MSVC. Toolchain validation gate.
+- [x] 1.1 Add clock_gettime/CLOCK_MONOTONIC shim to compat.h (QueryPerformanceCounter-based). Wire in iobench.c:19 only.
+- [x] 1.2 Add lseek → _lseeki64 shim to compat.h. Wire into iobench.c:39. (combined with 1.1)
+- [x] 1.3 Confirm iobench.c's reduction(+:tot) OpenMP clause compiles under /openmp (verification step). (verified in 1.1 compile)
+- [x] 1.4 Full compile + link of iobench.c under MSVC. Toolchain validation gate. (PASS — iobench.exe produced, runs without crash)
 
 ## PHASE 2 — compat.h mechanical shims (Tier 2, remaining files)
 - [ ] 2.1 strdup → _strdup shim in compat.h. Confirm st.h:81,140 resolve.

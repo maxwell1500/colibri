@@ -56,8 +56,9 @@ static float *falloc(int64_t n) { float *p = malloc(n*sizeof(float)); if(!p){fpr
 
 /* y[S,O] = x[S,I] @ W^T,  W e' [O,I] row-major */
 static void matmul(float *y, const float *x, const float *W, int S, int I, int O) {
+    int o;
     #pragma omp parallel for schedule(static)
-    for (int o = 0; o < O; o++) {
+    for (o = 0; o < O; o++) {
         const float *w = W + (int64_t)o * I;
         for (int s = 0; s < S; s++) {
             const float *xs = x + (int64_t)s * I;
@@ -71,8 +72,9 @@ static void matmul(float *y, const float *x, const float *W, int S, int I, int O
 /* y[1,O] = x[1,I] @ W^T con W quantizzato: q[O,I] int8 + scala per riga.
  * W[o,i] ~= q[o,i]*scale[o]  ->  y[o] = scale[o] * sum_i x[i]*q[o,i]. */
 static void matmul_q(float *y, const float *x, const int8_t *q, const float *scale, int I, int O) {
+    int o;
     #pragma omp parallel for schedule(static)
-    for (int o = 0; o < O; o++) {
+    for (o = 0; o < O; o++) {
         const int8_t *w = q + (int64_t)o * I;
         float acc = 0.f;
         for (int i = 0; i < I; i++) acc += x[i] * (float)w[i];
@@ -84,8 +86,9 @@ static void matmul_q(float *y, const float *x, const int8_t *q, const float *sca
  * Replica quant_dequant() del Python: scale = amax(|w|, riga)/qmax, q = round(w/scale). */
 static void quantize_rows(const float *w, int8_t *q, float *scale, int O, int I, int bits) {
     int qmax = (1 << (bits - 1)) - 1;     /* 8->127, 4->7, 2->1 */
+    int o;
     #pragma omp parallel for schedule(static)
-    for (int o = 0; o < O; o++) {
+    for (o = 0; o < O; o++) {
         const float *wr = w + (int64_t)o * I;
         float amax = 0.f; for (int i = 0; i < I; i++) { float a = fabsf(wr[i]); if (a > amax) amax = a; }
         float s = amax / qmax; if (s < 1e-8f) s = 1e-8f;
@@ -237,8 +240,9 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
     int Tk = pos_base + S;             /* numero di key totali disponibili */
     float scale = 1.f / sqrtf((float)hd);
     float *ctx = falloc((int64_t)S*D);
+    int hh;
     #pragma omp parallel for collapse(2) schedule(static)
-    for (int hh = 0; hh < H; hh++) {
+    for (hh = 0; hh < H; hh++) {
         for (int s = 0; s < S; s++) {
             int qpos = pos_base + s;
             const float *qv = q + (int64_t)s*D + hh*hd;
