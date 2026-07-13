@@ -14,12 +14,12 @@
 - [x] 1.4 Full compile + link of iobench.c under MSVC. Toolchain validation gate. (PASS — iobench.exe produced, runs without crash)
 
 ## PHASE 2 — compat.h mechanical shims (Tier 2, remaining files)
-- [ ] 2.1 strdup → _strdup shim in compat.h. Confirm st.h:81,140 resolve.
-- [ ] 2.2 lseek shim reused for st.h — verify st.h does NOT call lseek directly.
-- [ ] 2.3 clock_gettime shim reused for glm.c:227,3592 and olmoe.c:53.
-- [ ] 2.4 O_DIRECT twin-fd at st.h:82-85: verify existing #else branch handles Windows (documentation step).
-- [ ] 2.5 dirent.h shim: FindFirstFileA/FindNextFileA wrapper in compat.h. Guard st.h:16.
-- [ ] 2.6 Compile st.h-dependent translation units (olmoe.c) to confirm Tier 2 shims resolve.
+- [x] 2.1 strdup → _strdup shim in compat.h. Confirm st.h:81,140 resolve. (combined with 1.1)
+- [x] 2.2 lseek shim reused for st.h — verify st.h does NOT call lseek directly. (verified)
+- [x] 2.3 clock_gettime shim reused for glm.c:227,3592 and olmoe.c:53. (olmoe.c compiles)
+- [x] 2.4 O_DIRECT twin-fd at st.h:82-85: verify existing #else branch handles Windows. (already handled by existing #else)
+- [x] 2.5 dirent.h shim: FindFirstFileA/FindNextFileA wrapper in compat.h. Guard st.h:16. (combined with 1.1)
+- [x] 2.6 Compile st.h-dependent translation units (olmoe.c) to confirm Tier 2 shims resolve. (PASS)
 
 ## PHASE 3 — pthread compat layer (Tier 1, the real work)
 - [ ] 3.1 In compat_pthread.h: define pthread_t → HANDLE, pthread_mutex_t → SRWLOCK, pthread_cond_t → CONDITION_VARIABLE. Write mapping table in ARCHITECTURE.md.

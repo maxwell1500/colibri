@@ -23,11 +23,15 @@
 #include <math.h>
 #include <time.h>
 #include <limits.h>
+#ifndef _WIN32
 #include <pthread.h>                              /* thread I/O del PILOTA */
+#endif
 #include <stdatomic.h>                            /* PIPE ready-flags/job queue + PILOT_REAL cross-layer handshake */
+#ifndef _WIN32
 #include <sched.h>                                /* sched_yield: PIPE spin / PILOT barrier */
 #include <unistd.h>
 #include <sys/select.h>
+#endif
 #if defined(__APPLE__) || defined(__linux__)
 #include <sys/resource.h>
 #include <sys/mman.h>                             /* mlock: inchioda le pagine in RAM / wire pages into RAM */
@@ -240,14 +244,16 @@ static float *falloc(int64_t n){
 
 /* y[S,O] = x[S,I] @ W^T, W[O,I] f32 */
 static void matmul(float *y, const float *x, const float *W, int S, int I, int O){
+    int o;
     #pragma omp parallel for schedule(static)
-    for (int o=0;o<O;o++){ const float *w=W+(int64_t)o*I;
+    for (o=0;o<O;o++){ const float *w=W+(int64_t)o*I;
         for (int s=0;s<S;s++){ const float *xs=x+(int64_t)s*I; float a=0; for(int i=0;i<I;i++) a+=xs[i]*w[i]; y[(int64_t)s*O+o]=a; } }
 }
 /* y[S,O] = x[S,I] @ W^T con W quantizzato int8 per-riga + scala[O] (dequant-on-use) */
 static void matmul_q(float *y, const float *x, const int8_t *q, const float *scale, int S, int I, int O){
+    int o;
     #pragma omp parallel for schedule(static)
-    for (int o=0;o<O;o++){ const int8_t *w=q+(int64_t)o*I; float sc=scale[o];
+    for (o=0;o<O;o++){ const int8_t *w=q+(int64_t)o*I; float sc=scale[o];
         for (int s=0;s<S;s++){ const float *xs=x+(int64_t)s*I; float a=0; int i=0;
 #ifdef __AVX2__
             __m256 acc=_mm256_setzero_ps();
@@ -266,8 +272,9 @@ static void matmul_q(float *y, const float *x, const int8_t *q, const float *sca
 /* y[S,O] = x[S,I] @ W^T con W int4 impacchettato (2 valori/byte) + scala[O]. */
 static void matmul_i4(float *y, const float *x, const uint8_t *q4, const float *scale, int S, int I, int O){
     int rb=(I+1)/2;
+    int o;
     #pragma omp parallel for schedule(static)
-    for (int o=0;o<O;o++){ const uint8_t *w=q4+(int64_t)o*rb; float sc=scale[o];
+    for (o=0;o<O;o++){ const uint8_t *w=q4+(int64_t)o*rb; float sc=scale[o];
         for (int s=0;s<S;s++){ const float *xs=x+(int64_t)s*I; float a=0; int i=0;
 #ifdef __AVX2__
             const __m128i m4=_mm_set1_epi8(0x0F); const __m256i b8=_mm256_set1_epi32(8);
@@ -302,11 +309,12 @@ static void matmul_i4(float *y, const float *x, const uint8_t *q4, const float *
  * OpenMP dispatch covers both matrices. KTransformers uses persistent pools;
  * this keeps colibri dependency-free while removing one team launch/expert. */
 static void matmul_i4_pair(float *yg, float *yu, const float *x,
-                           const uint8_t *qg, const float *sg,
-                           const uint8_t *qu, const float *su, int I, int O){
+                            const uint8_t *qg, const float *sg,
+                            const uint8_t *qu, const float *su, int I, int O){
     int rb=(I+1)/2;
+    int z;
     #pragma omp parallel for schedule(static)
-    for(int z=0;z<2*O;z++){
+    for(z=0;z<2*O;z++){
         int o=z<O?z:z-O; const uint8_t *w=(z<O?qg:qu)+(int64_t)o*rb;
         float a=0; int i=0;
 #ifdef __AVX2__
@@ -348,8 +356,9 @@ static void expert_gate_up(float *g,float *u,const float *x,QT *wg,QT *wu,int S)
 /* y[S,O] = x[S,I] @ W^T con W int2 impacchettato (4 valori/byte) + scala[O]. nibble 2-bit -> [-2,1]. */
 static void matmul_i2(float *y, const float *x, const uint8_t *q2, const float *scale, int S, int I, int O){
     int rb=(I+3)/4;
+    int o;
     #pragma omp parallel for schedule(static)
-    for (int o=0;o<O;o++){ const uint8_t *w=q2+(int64_t)o*rb; float sc=scale[o];
+    for (o=0;o<O;o++){ const uint8_t *w=q2+(int64_t)o*rb; float sc=scale[o];
         for (int s=0;s<S;s++){ const float *xs=x+(int64_t)s*I; float a=0; int i=0;
 #ifdef __AVX2__
             const __m128i m2=_mm_set1_epi8(0x03); const __m256i b2=_mm256_set1_epi32(2);
@@ -580,15 +589,17 @@ static inline int32_t dot_i4i8(const uint8_t *w4, const int8_t *x, int I){
 }
 static void matmul_q_idot(float *y, const int8_t *xq, const float *sx, const int8_t *q,
                           const float *scale, int S, int I, int O){
+    int o;
     #pragma omp parallel for schedule(static)
-    for(int o=0;o<O;o++){ const int8_t *w=q+(int64_t)o*I; float sc=scale[o];
+    for(o=0;o<O;o++){ const int8_t *w=q+(int64_t)o*I; float sc=scale[o];
         for(int s=0;s<S;s++) y[(int64_t)s*O+o]=(float)dot_i8i8(w,xq+(int64_t)s*I,I)*sc*sx[s]; }
 }
 static void matmul_i4_idot(float *y, const int8_t *xq, const float *sx, const uint8_t *q4,
                            const float *scale, int S, int I, int O){
     int rb=(I+1)/2;
+    int o;
     #pragma omp parallel for schedule(static)
-    for(int o=0;o<O;o++){ const uint8_t *w=q4+(int64_t)o*rb; float sc=scale[o];
+    for(o=0;o<O;o++){ const uint8_t *w=q4+(int64_t)o*rb; float sc=scale[o];
         for(int s=0;s<S;s++) y[(int64_t)s*O+o]=(float)dot_i4i8(w,xq+(int64_t)s*I,I)*sc*sx[s]; }
 }
 
@@ -656,8 +667,9 @@ static void matmul_qt(float *y, const float *x, QT *w, int S){
 /* quantizza w[O,I] f32 -> int8 q[O,I] + scala[O] simmetrica per riga */
 static void quantize_rows(const float *w, int8_t *q, float *scale, int O, int I, int bits){
     int qmax=(1<<(bits-1))-1;
+    int o;
     #pragma omp parallel for schedule(static)
-    for(int o=0;o<O;o++){ const float *wr=w+(int64_t)o*I; float amax=0;
+    for(o=0;o<O;o++){ const float *wr=w+(int64_t)o*I; float amax=0;
         for(int i=0;i<I;i++){ float a=fabsf(wr[i]); if(a>amax)amax=a; }
         float s=amax/qmax; if(s<1e-8f)s=1e-8f; scale[o]=s;
         int8_t *qr=q+(int64_t)o*I;
@@ -668,8 +680,9 @@ static void quantize_rows(const float *w, int8_t *q, float *scale, int O, int I,
  * bits<=4: valori in [-qmax-1,qmax] stanno in un nibble [-8,7]; memorizzati come v+8 (0..15). */
 static void pack_int4(const float *w, uint8_t *q4, float *scale, int O, int I, int bits){
     int qmax=(1<<(bits-1))-1, rb=(I+1)/2;
+    int o;
     #pragma omp parallel for schedule(static)
-    for(int o=0;o<O;o++){ const float *wr=w+(int64_t)o*I; float amax=0;
+    for(o=0;o<O;o++){ const float *wr=w+(int64_t)o*I; float amax=0;
         for(int i=0;i<I;i++){ float a=fabsf(wr[i]); if(a>amax)amax=a; }
         float s=amax/qmax; if(s<1e-8f)s=1e-8f; scale[o]=s;
         uint8_t *qr=q4+(int64_t)o*rb;
@@ -684,8 +697,9 @@ static void pack_int4(const float *w, uint8_t *q4, float *scale, int O, int I, i
 /* quantizza w[O,I] f32 -> int2 impacchettato (4/byte) + scala[O]. valori nibble 2-bit in [-2,1]. */
 static void pack_int2(const float *w, uint8_t *q2, float *scale, int O, int I, int bits){
     int qmax=(1<<(bits-1))-1, rb=(I+3)/4;
+    int o;
     #pragma omp parallel for schedule(static)
-    for(int o=0;o<O;o++){ const float *wr=w+(int64_t)o*I; float amax=0;
+    for(o=0;o<O;o++){ const float *wr=w+(int64_t)o*I; float amax=0;
         for(int i=0;i<I;i++){ float a=fabsf(wr[i]); if(a>amax)amax=a; }
         float s=amax/qmax; if(s<1e-8f)s=1e-8f; scale[o]=s;
         uint8_t *qr=q2+(int64_t)o*rb;
@@ -1078,6 +1092,7 @@ static pthread_mutex_t g_map_mtx = PTHREAD_MUTEX_INITIALIZER;   /* expert_load e
 static void *map_of_fd(int fd){
     pthread_mutex_lock(&g_map_mtx);
     for(int i=0;i<g_nmaps;i++) if(g_maps[i].fd==fd){ void *b=g_maps[i].base; pthread_mutex_unlock(&g_map_mtx); return b; }
+#if defined(__APPLE__) || defined(__linux__)
     void *base=NULL; struct stat st;
     if(g_nmaps<512 && fstat(fd,&st)==0){
         size_t len=((size_t)st.st_size+16383)&~(size_t)16383;
@@ -1089,8 +1104,11 @@ static void *map_of_fd(int fd){
 #endif
         }
     }
+#else
+    (void)fd;
+#endif
     pthread_mutex_unlock(&g_map_mtx);
-    return base;
+    return NULL;
 }
 
 /* carica un expert nello slot. Container pre-quantizzato: le 3 matrici sono contigue nel
@@ -1143,12 +1161,14 @@ static int expert_load(Model *m, int layer, int eid, ESlot *s, int fatal){
                 qt[k]->s=(float*)((char*)bq[k]+tq[k]->off);
             }
             /* CPU pre-touch: fault the pages in HERE (cheap, parallel, overlapped with the
-             * resident-experts GPU submit) so the GPU never demand-faults file-backed pages
-             * (measured catastrophic). madvise starts async readahead, the touch guarantees
-             * residency. This is pread's I/O without the copy and without the slab. */
+              * resident-experts GPU submit) so the GPU never demand-faults file-backed pages
+              * (measured catastrophic). madvise starts async readahead, the touch guarantees
+              * residency. This is pread's I/O without the copy and without the slab. */
             for(int k=0;k<3;k++){
                 char *p=(char*)bw[k]+tw[k]->off; size_t n=(size_t)tw[k]->nbytes;
+#if defined(__APPLE__) || defined(__linux__)
                 madvise((void*)((uintptr_t)p & ~16383UL), n+16384, MADV_WILLNEED);
+#endif
                 volatile char acc=0;
                 for(size_t i=0;i<n;i+=4096) acc+=p[i];
                 acc+=p[n-1]; (void)acc;
@@ -1487,8 +1507,9 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
                 m->dsa_sel=malloc((size_t)m->dsa_scap*sizeof(int));
                 m->dsa_nsel=malloc((size_t)S*sizeof(int));
             }
+            int s;
             #pragma omp parallel for schedule(dynamic,1)
-            for(int s=0;s<S;s++){
+            for(s=0;s<S;s++){
                 KVState *ks=kvs?kvs[s]:m->kv;
                 int pos=positions?positions[s]:pos_base+s, nk=pos+1;
                 if(ks->kv_start[layer]!=0){ m->dsa_nsel[s]=0; continue; }
@@ -1552,8 +1573,9 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
         }
 #endif
         if(!cuda_core){
+        int s, h;
         #pragma omp parallel for collapse(2) schedule(static)
-        for(int s=0;s<S;s++) for(int h=0;h<H;h++){
+        for(s=0;s<S;s++) for(h=0;h<H;h++){
             KVState *ks=kvs?kvs[s]:m->kv;
             int pos=positions?positions[s]:pos_base+s;
             const float *qp=Q+(int64_t)s*H*qh+(int64_t)h*qh;
@@ -1598,8 +1620,9 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
     int64_t sc_cap = Tk - stL;
     float *sc_all = falloc((int64_t)omp_get_max_threads()*sc_cap);
     double tac=now_s();
+    int s, h;
     #pragma omp parallel for collapse(2) schedule(static)
-    for(int s=0;s<S;s++) for(int h=0;h<H;h++){
+    for(s=0;s<S;s++) for(h=0;h<H;h++){
         int pos=pos_base+s;
         const float *qp=Q+(int64_t)s*H*qh+(int64_t)h*qh;          /* [qk_nope | qk_rope] */
         const float *qr=qp+c->qk_nope;
@@ -1715,11 +1738,12 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
     m->enr[layer]=keff[S-1]; for(int kk=0;kk<keff[S-1];kk++) m->eroute[layer][kk]=idxs[(int64_t)(S-1)*K+kk];
     /* ---- FASE B: union degli expert del batch ---- */
     int *uniq=malloc((size_t)E*sizeof(int)); int nu=0;
-    unsigned char seen[E]; memset(seen,0,(size_t)E);
+    unsigned char *seen=malloc((size_t)E); memset(seen,0,(size_t)E);
     for(int s=0;s<S;s++) for(int kk=0;kk<keff[s];kk++){
         int e=idxs[(int64_t)s*K+kk];
         if(!seen[e]){ seen[e]=1; uniq[nu++]=e; }
     }
+    free(seen);
     /* ---- FASE C/D: risolvi (pin/cache/disco) e calcola, a blocchi di 64 unici ---- */
     float *xg=falloc((int64_t)S*D), *gg=falloc((int64_t)S*I), *uu=falloc((int64_t)S*I), *hh=falloc((int64_t)S*D);
     int *rows=malloc(S*sizeof(int)); float *rw=malloc(S*sizeof(float));
@@ -1810,8 +1834,9 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
                 pipe_dispatch(m,layer,eids,nmiss);
                 m->t_edisk += now_s()-t0;           /* dispatch only; real reads hide behind matmul */
             } else { double t0=now_s();             /* ORIGINALE: blocking parallel load */
+                int q;
                 #pragma omp parallel for schedule(dynamic,1)
-                for(int q=0;q<nmiss;q++) expert_load(m,layer,uniq[base+missk[q]],&m->ws[q],1);
+                for(q=0;q<nmiss;q++) expert_load(m,layer,uniq[base+missk[q]],&m->ws[q],1);
                 m->t_edisk += now_s()-t0; }
         }
         /* I/O ASINCRONO: readahead (WILLNEED) del blocco SUCCESSIVO mentre calcoliamo
@@ -1923,8 +1948,9 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
             }
         }
         double tg=now_s();
+        int di;
         #pragma omp parallel for if(g_cuda_ndev>1) schedule(static)
-        for(int di=0;di<g_cuda_ndev;di++) if(dev_nc[di])
+        for(di=0;di<g_cuda_ndev;di++) if(dev_nc[di])
             dev_ok[di]=coli_cuda_expert_group(dev_g[di],dev_u[di],dev_d[di],dev_rows[di],dev_nc[di],
                 group_y+(int64_t)dev_off[di]*D,group_x+(int64_t)dev_off[di]*D);
         for(int di=0;di<g_cuda_ndev;di++){
@@ -3357,8 +3383,9 @@ static void pin_load(Model *m, const char *statspath, double gb){
 #endif
     /* Load the VRAM-ranked prefix first.  Once uploaded its host backing is
      * released before the disjoint RAM-ranked suffix is allocated. */
+    int a;
     #pragma omp parallel for schedule(dynamic,1)
-    for(int a=0;a<(gpu_prefix?gpu_prefix:npin);a++)
+    for(a=0;a<(gpu_prefix?gpu_prefix:npin);a++)
         expert_load(m,r[a].l,r[a].e,&m->pin[r[a].l][slot_of[a]],1);
     m->resident_bytes+=(int64_t)(gpu_prefix?gpu_prefix:npin)*eb;
 #ifdef COLI_CUDA
@@ -3401,8 +3428,9 @@ static void pin_load(Model *m, const char *statspath, double gb){
     }
 #endif
     if(gpu_prefix>0&&gpu_prefix<npin){
+        int a;
         #pragma omp parallel for schedule(dynamic,1)
-        for(int a=gpu_prefix;a<npin;a++)
+        for(a=gpu_prefix;a<npin;a++)
             expert_load(m,r[a].l,r[a].e,&m->pin[r[a].l][slot_of[a]],1);
         m->resident_bytes+=(int64_t)(npin-gpu_prefix)*eb;
     }

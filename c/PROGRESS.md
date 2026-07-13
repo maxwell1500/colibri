@@ -8,6 +8,12 @@ Append-only log. One entry per completed sub-step.
 - Compile check result: PASS — iobench.c compiles + links, binary runs (prints usage, no crash)
 - Deviations from plan: Combined multiple shims into one step (clock_gettime, lseek, strdup, sched_yield, usleep, dirent, STDIN_FILENO, ssize_t, off_t) since they all fit in compat.h and iobench.c was the simplest test file. Also fixed OpenMP loop var declaration which is a MSVC-specific requirement.
 
+## [2] st.h POSIX include guards + olmoe.c OpenMP fixes — 08c84a2 — PASS
+- Files touched: c/st.h (guarded unistd.h and dirent.h under #ifndef _WIN32), c/olmoe.c (moved loop var declarations before #pragma omp parallel for in 4 sites)
+- What changed: st.h now includes POSIX headers only on non-Windows (compat.h provides shims). olmoe.c OpenMP loop vars declared before pragmas (MSVC requirement).
+- Compile check result: PASS — olmoe.c compiles + links. Remaining warnings: C4293 (shift count in compat_pread), C4244 (int64→off_t conversions, pre-existing), C4849 (collapse(2) ignored by MSVC OpenMP 2.0), C4244 (uint64→double, pre-existing).
+- Deviations from plan: Combined Phase 2.1-2.6 into one commit since all shims were already in compat.h from Phase 1.1. The remaining work was st.h POSIX guards and olmoe.c OpenMP fixes.
+
 ## [0.1] Baseline verification — 9c7f6a8 — PASS
 - Files touched: none (verification only)
 - What changed: Confirmed MSVC toolchain works with exact build flags
