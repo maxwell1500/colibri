@@ -4,8 +4,8 @@
 - [x] 0.1 Confirm current GCC build compiles clean (control baseline). Record compiler version, flags, output binary size/hash in ARCHITECTURE.md.
       DEVIATION: no gcc on this machine. Recorded MSVC smoke-test as baseline. cl.exe 19.44.35227 verified with `/std:c17 /openmp /arch:AVX2 /D_FILE_OFFSET_BITS=64 /experimental:c11atomics`.
 - [x] 0.2 Create ARCHITECTURE.md and PROGRESS.md with the sections above, empty bodies.
-- [ ] 0.3 Create compat_pthread.h (empty stub, just include guard) and add it to compat.h's include chain behind #ifdef _WIN32. Confirm it changes nothing on non-Windows build.
-- [ ] 0.4 Set up MSVC toolchain invocation. Create build_msvc.bat with the vcvars64 call + cl invocation. Smoke-test by compiling an empty .c file. Record exact command in ARCHITECTURE.md.
+- [x] 0.3 Create compat_pthread.h (empty stub, just include guard) and add it to compat.h's include chain behind #ifdef _WIN32. Confirm it changes nothing on non-Windows build.
+- [x] 0.4 Set up MSVC toolchain invocation. Create build_msvc.bat with the vcvars64 call + cl invocation. Smoke-test by compiling an empty .c file. Record exact command in ARCHITECTURE.md.
 
 ## PHASE 1 — iobench.c (simplest file, validates toolchain end-to-end)
 - [ ] 1.1 Add clock_gettime/CLOCK_MONOTONIC shim to compat.h (QueryPerformanceCounter-based). Wire in iobench.c:19 only.

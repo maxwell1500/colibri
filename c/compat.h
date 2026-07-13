@@ -67,6 +67,12 @@ static inline int compat_open_direct(const char *path){
  * =================================================================== */
 #ifdef _WIN32
 
+/* Suppress CRT deprecation warnings for POSIX names (_strdup, getenv, close, etc.) */
+#pragma warning(disable:4996)
+#ifndef _CRT_SECURE_NO_WARNINGS
+#define _CRT_SECURE_NO_WARNINGS
+#endif
+
 /* Belt-and-braces: 64-bit off_t mandatory — model is 370 GB, every pread
  * region can exceed 2 GB. 32-bit off_t silently wraps >4 GB offsets into the
  * first 4 GB → reads wrong weight bytes → silent token corruption. */
@@ -83,6 +89,13 @@ static inline int compat_open_direct(const char *path){
 #include <malloc.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <sys/types.h>          /* off_t for pread/lseek signatures */
+
+/* --- ssize_t: not defined by MSVC CRT --- */
+#ifndef _SSIZE_T_DEFINED
+typedef SSIZE_T ssize_t;
+#define _SSIZE_T_DEFINED
+#endif
 
 /* --- O_BINARY: belt-and-braces vs CRT text-mode (0x0A byte corruption) --- */
 #ifndef O_BINARY
@@ -221,6 +234,98 @@ static inline int compat_setenv(const char *name, const char *value, int overwri
     return SetEnvironmentVariableA(name, value) ? 0 : -1;
 }
 #define setenv(name,value,overwrite) compat_setenv(name,value,overwrite)
+
+/* --- clock_gettime / CLOCK_MONOTONIC -> QueryPerformanceCounter --- */
+/* struct timespec is provided by MSVC's <time.h> under C11/C17 mode.
+ * On Linux/macOS it comes from <time.h> or <unistd.h>. No definition needed here. */
+#ifndef CLOCK_MONOTONIC
+#define CLOCK_MONOTONIC 0
+#endif
+static inline int compat_clock_gettime(int clk, struct timespec *ts){
+    (void)clk;
+    LARGE_INTEGER f, c;
+    if(!QueryPerformanceFrequency(&f)) return -1;
+    if(!QueryPerformanceCounter(&c)) return -1;
+    double sec = (double)c.QuadPart / (double)f.QuadPart;
+    ts->tv_sec = (long)sec;
+    ts->tv_nsec = (long)((sec - (double)ts->tv_sec) * 1e9);
+    return 0;
+}
+#define clock_gettime compat_clock_gettime
+
+/* --- sched_yield -> YieldProcessor --- */
+#define sched_yield() YieldProcessor()
+
+/* --- usleep -> Sleep (microsecond to millisecond rounding) --- */
+static inline void compat_usleep(unsigned long usecs){
+    Sleep((DWORD)((usecs + 999) / 1000));
+}
+#define usleep compat_usleep
+
+/* --- strdup -> _strdup --- */
+#ifndef strdup
+#define strdup _strdup
+#endif
+
+/* --- lseek -> _lseeki64 --- */
+#ifndef lseek
+#define lseek _lseeki64
+#endif
+
+/* --- STDIN_FILENO -> _fileno(stdin) --- */
+#ifndef STDIN_FILENO
+#define STDIN_FILENO _fileno(stdin)
+#endif
+
+/* --- dirent.h shim: opendir/readdir/closedir via FindFirstFileA/FindNextFileA --- */
+typedef struct {
+    HANDLE h;
+    WIN32_FIND_DATAA fd;
+    int first_done;
+} compat_DIR;
+typedef compat_DIR DIR;
+typedef struct compat_dirent { char d_name[MAX_PATH]; } compat_dirent;
+#define dirent compat_dirent
+
+static inline DIR* compat_opendir(const char *name){
+    compat_DIR *d = (compat_DIR*)malloc(sizeof(*d));
+    if(!d) return NULL;
+    char pattern[MAX_PATH + 3];
+    int len = (int)strlen(name);
+    if(len + 3 > MAX_PATH){ free(d); return NULL; }
+    memcpy(pattern, name, (size_t)len);
+    pattern[len] = '\\';
+    pattern[len+1] = '*';
+    pattern[len+2] = '\0';
+    d->h = FindFirstFileA(pattern, &d->fd);
+    d->first_done = 0;
+    if(d->h == INVALID_HANDLE_VALUE){ free(d); return NULL; }
+    return (DIR*)d;
+}
+
+static inline struct dirent* compat_readdir(DIR *dir){
+    compat_DIR *d = (compat_DIR*)dir;
+    if(!d->first_done){
+        d->first_done = 1;
+    } else {
+        if(!FindNextFileA(d->h, &d->fd)) return NULL;
+    }
+    struct dirent *e = (struct dirent*)malloc(sizeof(struct dirent));
+    if(!e) return NULL;
+    strncpy_s(e->d_name, MAX_PATH, d->fd.cFileName, _TRUNCATE);
+    return e;
+}
+
+static inline int compat_closedir(DIR *dir){
+    compat_DIR *d = (compat_DIR*)dir;
+    if(!d) return -1;
+    FindClose(d->h);
+    free(d);
+    return 0;
+}
+#define opendir compat_opendir
+#define readdir compat_readdir
+#define closedir compat_closedir
 
 /* --- pthread compat layer (Win32: SRWLOCK + CONDITION_VARIABLE + CreateThread) --- */
 #include "compat_pthread.h"

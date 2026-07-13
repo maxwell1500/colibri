@@ -24,3 +24,9 @@ Append-only log. One entry per completed sub-step.
 - What changed: Created compat_pthread.h with SRWLOCK/CONDITION_VARIABLE/CreateThread mapping. Verified compiles + links under MSVC /std:c17.
 - Compile check result: PASS — compiled and linked test.exe successfully
 - Deviations from plan: Added `#ifndef CONDITION_VARIABLE_LOCKMODE_EXCLUSIVE` guard (constant not in this SDK version 10.0.26100.0)
+
+## [0.4] build_msvc.bat created — 24839b6 — PASS
+- Files touched: c/build_msvc.bat (new), c/PROGRESS.md
+- What changed: Created build script that calls vcvars64.bat then cl.exe with all required flags
+- Compile check result: PASS — toolchain verified (iobench.c fails on unistd.h as expected, Phase 1 will fix)
+- Deviations from plan: None

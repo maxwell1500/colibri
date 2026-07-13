@@ -8,7 +8,9 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <fcntl.h>
+#ifndef _WIN32
 #include <unistd.h>
+#endif
 #include <time.h>
 #include <errno.h>
 #include <string.h>
@@ -47,8 +49,9 @@ int main(int argc,char**argv){
     #pragma omp parallel num_threads(nth) reduction(+:tot)
     {
         void *buf; if(posix_memalign(&buf,4096,blk)){perror("memalign");exit(1);}
+        int i;
         #pragma omp for schedule(dynamic,1)
-        for(int i=0;i<n;i++){
+        for(i=0;i<n;i++){
             ssize_t r=pread(fd,buf,blk,offs[i]);
             if(r<0) perror("pread"); else tot+=r;
         }
