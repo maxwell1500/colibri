@@ -18,3 +18,9 @@ Append-only log. One entry per completed sub-step.
 - What changed: Created architecture document, progress log, and phase plan
 - Compile check result: N/A (documentation only)
 - Deviations from plan: None
+
+## [0.3] compat_pthread.h stub created — a11d43e — PASS
+- Files touched: c/compat_pthread.h (new), c/compat.h (added #include "compat_pthread.h" inside _WIN32 block)
+- What changed: Created compat_pthread.h with SRWLOCK/CONDITION_VARIABLE/CreateThread mapping. Verified compiles + links under MSVC /std:c17.
+- Compile check result: PASS — compiled and linked test.exe successfully
+- Deviations from plan: Added `#ifndef CONDITION_VARIABLE_LOCKMODE_EXCLUSIVE` guard (constant not in this SDK version 10.0.26100.0)
