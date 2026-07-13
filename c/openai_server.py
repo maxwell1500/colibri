@@ -986,25 +986,35 @@ def serve(model, host="127.0.0.1", port=8000, model_id="glm-5.2-colibri", api_ke
     server = APIServer((host, port), None, model_id, api_key, max_tokens, origins,
                        max_queue, queue_timeout, kv_slots)
     runtime = None
-    previous_sigterm = signal.getsignal(signal.SIGTERM)
+    previous_sigterm = None
     try:
         runtime = Engine(engine,model,cap,max_tokens,env,kv_slots)
         server.engine = runtime
         print(f"OpenAI-compatible API listening on http://{host}:{port}/v1", file=sys.stderr)
-        signal.signal(signal.SIGTERM, lambda *_: threading.Thread(target=server.shutdown, daemon=True).start())
+        # SIGTERM is not a real signal on Windows; skip the handler there.
+        if hasattr(signal, "SIGTERM") and sys.platform != "win32":
+            previous_sigterm = signal.getsignal(signal.SIGTERM)
+            signal.signal(signal.SIGTERM, lambda *_: threading.Thread(target=server.shutdown, daemon=True).start())
         server.serve_forever()
     finally:
-        signal.signal(signal.SIGTERM, previous_sigterm)
+        if previous_sigterm is not None:
+            signal.signal(signal.SIGTERM, previous_sigterm)
         server.scheduler.close()
         server.server_close()
         if runtime is not None:
             runtime.close()
 
 
+def _default_engine():
+    """Return the default engine binary path, adding .exe on Windows."""
+    name = "glm.exe" if sys.platform == "win32" else "glm"
+    return str(HERE / name)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", default=os.environ.get("COLI_MODEL"), required=not os.environ.get("COLI_MODEL"))
-    parser.add_argument("--engine", default=str(HERE / "glm"))
+    parser.add_argument("--engine", default=_default_engine())
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--model-id", default=os.environ.get("COLI_MODEL_ID", "glm-5.2-colibri"))

@@ -3113,6 +3113,15 @@ static void run_serve_mux(Model *m, const char *snap){
     KVState *initial=m->kv; free(initial->kv_start); free(initial);
     ServeCtx *ctx=calloc(nctx,sizeof(*ctx)); ServeReq *req=calloc(nctx,sizeof(*req));
     for(int i=0;i<nctx;i++) serve_ctx_init(m,&ctx[i],snap,i,maxctx);
+#ifdef _WIN32
+    /* CRITICAL: stdin/stdout default to TEXT mode on Windows — \n is translated
+     * to \r\n on write, and 0x0A bytes inside DATA payloads get corrupted.
+     * The Python server reads raw bytes via subprocess.Popen(stdout=PIPE), so
+     * it would see DATA <id> <size>\r\n and a mangled payload. Switch both
+     * to binary mode before any protocol I/O. */
+    _setmode(_fileno(stdin), O_BINARY);
+    _setmode(_fileno(stdout), O_BINARY);
+#endif
     setvbuf(stdin,NULL,_IONBF,0);
     printf("\x01\x01READY\x01\x01\nSTAT 0 0.00 0.0 %.2f\n",rss_gb()); fflush(stdout);
     int eof=0;
@@ -3168,6 +3177,10 @@ static void run_serve(Model *m, const char *snap){
     KVState *initial=m->kv; free(initial->kv_start); free(initial);
     ServeCtx *ctx=calloc(nctx,sizeof(ServeCtx));
     for(int i=0;i<nctx;i++) serve_ctx_init(m,&ctx[i],snap,i,maxctx);
+#ifdef _WIN32
+    _setmode(_fileno(stdin), O_BINARY);
+    _setmode(_fileno(stdout), O_BINARY);
+#endif
     int active=0; ServeCtx *sc=&ctx[0]; kv_bind(m,&sc->kv);
     fprintf(stderr,"[KV] context slots: %d x %d tokens, projected pool %.2f GB\n",
         nctx,maxctx,kv_pool_bytes(m,maxctx)/1e9);
