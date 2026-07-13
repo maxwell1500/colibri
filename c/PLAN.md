@@ -22,24 +22,24 @@
 - [x] 2.6 Compile st.h-dependent translation units (olmoe.c) to confirm Tier 2 shims resolve. (PASS)
 
 ## PHASE 3 — pthread compat layer (Tier 1, the real work)
-- [ ] 3.1 In compat_pthread.h: define pthread_t → HANDLE, pthread_mutex_t → SRWLOCK, pthread_cond_t → CONDITION_VARIABLE. Write mapping table in ARCHITECTURE.md.
-- [ ] 3.2 Implement pthread_create via CreateThread with adapter shim.
-- [ ] 3.3 Implement pthread_mutex_init/lock/unlock via SRWLOCK.
-- [ ] 3.4 Implement pthread_cond_init/wait/broadcast via CONDITION_VARIABLE.
+- [x] 3.1 In compat_pthread.h: define pthread_t → HANDLE, pthread_mutex_t → SRWLOCK, pthread_cond_t → CONDITION_VARIABLE. Write mapping table in ARCHITECTURE.md. (done in P0.3)
+- [x] 3.2 Implement pthread_create via CreateThread with adapter shim. (done in P0.3)
+- [x] 3.3 Implement pthread_mutex_init/lock/unlock via SRWLOCK. (done in P0.3)
+- [x] 3.4 Implement pthread_cond_init/wait/broadcast via CONDITION_VARIABLE. (done in P0.3)
 - [x] 3.5 Guard the 4 POSIX includes at glm.c:26-30 with #ifndef _WIN32 / #else include compat_pthread.h #endif.
 - [x] 3.6 Add sched_yield→YieldProcessor() and usleep→compat_usleep shims to compat.h. (already in compat.h from Phase 1.1)
 - [x] 3.7 Compile glm.c — expect Tier 1 (pthread) errors to be GONE. List remaining errors. (pthread resolved; remaining: __atomic_* at 9 sites, fd_set/select at serve-mode)
-- [ ] 3.8 Walk all 27 pthread call sites one by one, confirm each resolves to a shim symbol. (verified in compile output — no pthread errors)
-- [ ] 3.9 T1-9 serve-mode select() rewrite: STDIN_FILENO + WaitForSingleObject on stdin HANDLE.
+- [x] 3.8 Walk all 27 pthread call sites one by one, confirm each resolves to a shim symbol. (verified in compile output — no pthread errors)
+- [x] 3.9 T1-9 serve-mode select() rewrite: STDIN_FILENO + WaitForSingleObject on stdin HANDLE.
 
 ## PHASE 4 — Atomics conversion
-- [ ] 4.1 Change glm.c:169 `uint64_t eclock` → `_Atomic uint64_t eclock`. Change glm.c:2022 `volatile unsigned` → `_Atomic unsigned`.
-- [ ] 4.2 Convert glm.c:1741, 1960, 2049 (`__atomic_add_fetch` → `atomic_fetch_add_explicit`).
-- [ ] 4.3 Convert glm.c:2063, 2064 (`__atomic_load_n` → `atomic_load_explicit`).
-- [ ] 4.4 Convert glm.c:2068, 2099, 2100 (store/load mix).
-- [ ] 4.5 Convert glm.c:2102 (`__atomic_store_n` → `atomic_store_explicit`).
-- [ ] 4.6 Confirm `#include <stdatomic.h>` at glm.c:27 is unguarded.
-- [ ] 4.7 Full glm.c compile attempt. Resolve remaining errors one at a time.
+- [x] 4.1 Change glm.c:169 `uint64_t eclock` → `_Atomic uint64_t eclock`. Change glm.c:2022 `volatile unsigned` → `_Atomic unsigned`.
+- [x] 4.2 Convert glm.c:1741, 1960, 2049 (`__atomic_add_fetch` → `atomic_fetch_add_explicit`). (lines shifted due to edits)
+- [x] 4.3 Convert glm.c:2063, 2064 (`__atomic_load_n` → `atomic_load_explicit`). (lines shifted)
+- [x] 4.4 Convert glm.c:2068, 2099, 2100 (store/load mix). (lines shifted)
+- [x] 4.5 Convert glm.c:2102 (`__atomic_store_n` → `atomic_store_explicit`). (lines shifted)
+- [x] 4.6 Confirm `#include <stdatomic.h>` at glm.c:27 is unguarded. (already unguarded, works under /std:c17)
+- [x] 4.7 Full glm.c compile attempt. Resolve remaining errors one at a time. (PASS — only warnings remain)
 
 ## PHASE 5 — Full link & smoke test
 - [ ] 5.1 Full solution build: all 4 .c files + compat.h + compat_pthread.h under build_msvc.bat.

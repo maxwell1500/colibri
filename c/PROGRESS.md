@@ -20,6 +20,12 @@ Append-only log. One entry per completed sub-step.
 - Compile check result: Partial PASS — compiles past all OpenMP/VLA/mmap errors. Remaining errors: 9 __atomic_* builtins (Phase 4) + fd_set/select (T1-9 serve-mode).
 - Deviations from plan: Fixed all 17 OpenMP sites in one commit instead of separate sub-steps (all same pattern, mechanical change).
 
+## [4] Atomics conversion + serve-mode select() rewrite — 89ce71f — PASS
+- Files touched: c/glm.c (converted m->eclock to _Atomic uint64_t, pilot_r/pilot_w to _Atomic unsigned; converted 9 __atomic_* builtins to atomic_*_explicit with preserved memory orders; replaced fd_set/select/FD_ZERO/FD_SET/FD_ISSET with WaitForSingleObject on stdin HANDLE under #ifdef _WIN32)
+- What changed: All GCC __atomic_* builtins replaced with C11 atomic_*_explicit. Memory orders preserved exactly (RELAXED→relaxed, ACQUIRE→acquire, RELEASE→release). Serve-mode select() replaced with Windows-native WaitForSingleObject.
+- Compile check result: PASS — glm.c compiles to 265 KB .obj with only warnings (C4244 int64→off_t conversions, C4849 collapse(2) ignored by MSVC OpenMP 2.0, C4293 shift count). No errors.
+- Deviations from plan: None — followed the handoff document exactly.
+
 ## [0.1] Baseline verification — 9c7f6a8 — PASS
 - Files touched: none (verification only)
 - What changed: Confirmed MSVC toolchain works with exact build flags
