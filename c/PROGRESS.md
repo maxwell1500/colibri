@@ -13,8 +13,8 @@ Append-only log. One entry per completed sub-step.
   - No gcc/make on this machine — MSVC smoke-test is the baseline
 - Deviations from plan: Phase 0.1 adapted for no-gcc environment (recorded MSVC smoke-test as baseline instead of GCC control)
 
-## [0.2] Scaffolding created — pending commit
-- Files touched: c/ARCHITECTURE.md, c/PROGRESS.md
-- What changed: Created architecture document and progress log
+## [0.2] Scaffolding created — d3577f3 — PASS
+- Files touched: c/ARCHITECTURE.md, c/PROGRESS.md, c/PLAN.md
+- What changed: Created architecture document, progress log, and phase plan
 - Compile check result: N/A (documentation only)
 - Deviations from plan: None

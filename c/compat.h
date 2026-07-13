@@ -222,6 +222,9 @@ static inline int compat_setenv(const char *name, const char *value, int overwri
 }
 #define setenv(name,value,overwrite) compat_setenv(name,value,overwrite)
 
+/* --- pthread compat layer (Win32: SRWLOCK + CONDITION_VARIABLE + CreateThread) --- */
+#include "compat_pthread.h"
+
 #endif /* _WIN32 */
 
 /* --- compat_aligned_free su piattaforme diverse da Windows ---
