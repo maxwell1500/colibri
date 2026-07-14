@@ -777,6 +777,7 @@ static float g_nuc=0.95f;/* NUCLEUS: top-p sul vocabolario (default dal generati
 static int g_topk=0;     /* TOPK=n -> usa n expert/token invece di config (ricerca: meno disco) */
 static float g_topp=0;   /* TOPP=p (0..1) -> top-p adattivo: tieni gli expert fino a peso cumulato p */
 static float g_vram_bias=0;  /* VRAM_BIAS=n -> boost router score for available experts */
+static int g_vram_filter=0;  /* VRAM_FILTER=1 -> post-topk filter unavailable experts */
 static int g_spec=1;     /* metodo C: SPEC=0 disabilita il prefetch speculativo cross-layer */
 static int g_draft=0;    /* metodo E: DRAFT=n token auto-speculati per forward via n-gram lookup
                           * (0=off). LOSSLESS: verifica = output identico al greedy. Default OFF:
@@ -1771,6 +1772,27 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
             for(int e=0;e<E;e++){ int tk=0; for(int j=0;j<kk;j++) if(idx[j]==e){tk=1;break;}
                 if(!tk && choice[e]>bv){bv=choice[e];best=e;} }
             idx[kk]=best; w[kk]=logit[best];
+        }
+        /* VRAM_FILTER: remove unavailable experts after top-k */
+        if(g_vram_filter){
+            int navail=0;
+            for(int kk=0; kk<Ksel; kk++){
+                if(is_warm(m,layer,idx[kk]))
+                    idx[navail++]=idx[kk];
+            }
+            if(navail<2){ /* too few available — restore original top-k */
+                navail=Ksel;
+                for(int kk=0; kk<Ksel; kk++){
+                    int best=-1; float bv=-1e30f;
+                    for(int e=0; e<E; e++){
+                        int tk=0;
+                        for(int j=0; j<kk; j++) if(idx[j]==e){ tk=1; break; }
+                        if(!tk && choice[e]>bv){ bv=choice[e]; best=e; }
+                    }
+                    idx[kk]=best; w[kk]=logit[best];
+                }
+            }
+            Ksel=navail;
         }
         int Ke=Ksel;
         if(g_topp>0 && g_topp<1.f){
@@ -3703,6 +3725,7 @@ int main(int argc, char **argv){
     g_topk = getenv("TOPK")?atoi(getenv("TOPK")):0;
     g_topp = getenv("TOPP")?atof(getenv("TOPP")):0;
     g_vram_bias = getenv("VRAM_BIAS")?atof(getenv("VRAM_BIAS")):0;
+    g_vram_filter = getenv("VRAM_FILTER")?atoi(getenv("VRAM_FILTER")):0;
     const char *policy=getenv("COLI_POLICY"); if(!policy) policy="quality";
     int experimental=!strcmp(policy,"experimental-fast");
     if(strcmp(policy,"quality")&&strcmp(policy,"balanced")&&!experimental){
