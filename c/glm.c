@@ -1761,8 +1761,8 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
         const float *xs=x+(int64_t)s*D;
         matmul(logit, xs, l->router, 1, D, E);
         for(int e=0;e<E;e++){ logit[e]=sigmoidf(logit[e]); choice[e]=logit[e]+l->router_bias[e]; }
-        /* VRAM_BIAS: soft boost for experts already in pin/ecache (skip MTP layer) */
-        if(g_vram_bias > 0 && layer < c->n_layers){
+        /* VRAM_BIAS: soft boost for experts already in pin/ecache */
+        if(g_vram_bias > 0){
             for(int e=0;e<E;e++)
                 if(is_warm(m,layer,e)) choice[e] += g_vram_bias;
         }
@@ -1773,9 +1773,8 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
                 if(!tk && choice[e]>bv){bv=choice[e];best=e;} }
             idx[kk]=best; w[kk]=logit[best];
         }
-        /* VRAM_FILTER: remove unavailable experts after top-k (skip MTP layer — its experts
-         * may not be pinned, and filtering them breaks draft generation) */
-        if(g_vram_filter && layer < c->n_layers){
+        /* VRAM_FILTER: remove unavailable experts after top-k */
+        if(g_vram_filter){
             int navail=0;
             for(int kk=0; kk<Ksel; kk++){
                 if(is_warm(m,layer,idx[kk]))
@@ -3818,14 +3817,6 @@ int main(int argc, char **argv){
     Model m; double t0=now_s(); model_init(&m,snap,cap,ebits,dbits);
     if(g_draft<0){
         g_draft = m.has_mtp ? 3 : 0;
-        /* MTP drafts predict full-model output, but VRAM_BIAS changes routing
-         * on model layers (0..n_layers-1) while MTP layer (n_layers) runs
-         * unbiasied. The routing mismatch makes draft predictions wrong,
-         * so disable MTP when VRAM_BIAS is active. */
-        if(g_draft>0 && g_vram_bias>0){
-            fprintf(stderr,"[MTP] disabled: VRAM_BIAS changes routing, breaking draft accuracy\n");
-            g_draft=0;
-        }
     }
     if(getenv("DSA_TOPK")) m.c.index_topk=atoi(getenv("DSA_TOPK"));   /* override per test */
     printf("loaded in %.2fs | resident dense: %.2f MB | layers=%d experts=%d | MTP %s (draft=%d)\n",
