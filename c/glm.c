@@ -3774,7 +3774,7 @@ int main(int argc, char **argv){
     Model m; double t0=now_s(); model_init(&m,snap,cap,ebits,dbits);
     if(g_draft<0){
 #ifdef COLI_CUDA
-        g_draft = (m.has_mtp&&!g_cuda_enabled) ? 3 : 0;
+        g_draft = m.has_mtp ? 3 : 0;
 #else
         g_draft = m.has_mtp ? 3 : 0;
 #endif
