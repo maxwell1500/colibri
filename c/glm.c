@@ -776,6 +776,7 @@ static float g_temp=-1;  /* TEMP: temperatura di sampling sui TOKEN. <0 = auto (
 static float g_nuc=0.95f;/* NUCLEUS: top-p sul vocabolario (default dal generation_config GLM-5.2) */
 static int g_topk=0;     /* TOPK=n -> usa n expert/token invece di config (ricerca: meno disco) */
 static float g_topp=0;   /* TOPP=p (0..1) -> top-p adattivo: tieni gli expert fino a peso cumulato p */
+static float g_vram_bias=0;  /* VRAM_BIAS=n -> boost router score for available experts */
 static int g_spec=1;     /* metodo C: SPEC=0 disabilita il prefetch speculativo cross-layer */
 static int g_draft=0;    /* metodo E: DRAFT=n token auto-speculati per forward via n-gram lookup
                           * (0=off). LOSSLESS: verifica = output identico al greedy. Default OFF:
@@ -1710,6 +1711,16 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
  * una volta sola e moltiplicato per tutte le posizioni che lo usano (pesi letti 1 volta);
  * lo shared expert e' un unico matmul a S righe. Per posizione l'accumulo resta
  * nell'ordine (routed nel loro ordine di union, poi shared). */
+
+/* Check if expert `eid` is warm (in pin or ecache for this layer) */
+static int is_warm(Model *m, int layer, int eid){
+    ESlot *P=m->pin[layer];
+    for(int z=0;z<m->npin[layer];z++) if(P[z].eid==eid) return 1;
+    ESlot *Sl=m->ecache[layer];
+    for(int z=0;z<m->ecn[layer];z++) if(Sl[z].eid==eid) return 1;
+    return 0;
+}
+
 static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
     if(g_pilot_real){   /* barriera cross-layer: prendi possesso di QUESTO layer e aspetta
                          * l'eventuale load-pilota in volo sullo stesso layer (dopodiche' il
@@ -1749,6 +1760,11 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
         const float *xs=x+(int64_t)s*D;
         matmul(logit, xs, l->router, 1, D, E);
         for(int e=0;e<E;e++){ logit[e]=sigmoidf(logit[e]); choice[e]=logit[e]+l->router_bias[e]; }
+        /* VRAM_BIAS: soft boost for experts already in pin/ecache */
+        if(g_vram_bias > 0){
+            for(int e=0;e<E;e++)
+                if(is_warm(m,layer,e)) choice[e] += g_vram_bias;
+        }
         int *idx=idxs+(int64_t)s*K; float *w=ws+(int64_t)s*K;
         int Ksel = g_topk>0 ? (g_topk<K?g_topk:K) : K;
         for(int kk=0;kk<Ksel;kk++){ int best=-1; float bv=-1e30f;
@@ -3686,6 +3702,7 @@ int main(int argc, char **argv){
     if(g_mmap) fprintf(stderr,"[MMAP] expert = viste zero-copy nei file (page cache = cache)\n");
     g_topk = getenv("TOPK")?atoi(getenv("TOPK")):0;
     g_topp = getenv("TOPP")?atof(getenv("TOPP")):0;
+    g_vram_bias = getenv("VRAM_BIAS")?atof(getenv("VRAM_BIAS")):0;
     const char *policy=getenv("COLI_POLICY"); if(!policy) policy="quality";
     int experimental=!strcmp(policy,"experimental-fast");
     if(strcmp(policy,"quality")&&strcmp(policy,"balanced")&&!experimental){
