@@ -4,6 +4,15 @@ Six improvements to the GLM-5.2 Colibri CUDA expert offload system. Each phase i
 self-contained and testable before proceeding. Every change includes exact file locations,
 code diffs, testing commands, and rollback procedures.
 
+## Status
+
+- [x] Phase 1: Fix expert_host_release heap corruption — COMPLETE (afaa2c6)
+- [x] Phase 2: Batched VRAM loading — COMPLETE (cbde06c)
+- [ ] Phase 3: Speculative VRAM prefetch
+- [x] Phase 4: Re-enable MTP draft with CUDA — COMPLETE (cadf046)
+- [ ] Phase 5: Overlapping VRAM upload with prefill
+- [ ] Phase 6: CUDA Unified Memory
+
 ---
 
 ## Phase 1: Fix resident_bytes Accounting

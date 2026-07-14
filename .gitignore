@@ -31,6 +31,13 @@ c/*.lib
 c/*.exp
 c/*.pdb
 
+# Build outputs in root (outputs to colibri root, not c/)
+glm.exe
+glm.obj
+glm.lib
+glm.exp
+glm.pdb
+
 # oracoli tiny generati (make_glm_oracle.py) e dati benchmark scaricati
 c/glm_tiny/
 c/glm_tiny_i2/
