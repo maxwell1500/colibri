@@ -26,6 +26,12 @@ Append-only log. One entry per completed sub-step.
 - Compile check result: PASS — glm.c compiles to 265 KB .obj with only warnings (C4244 int64→off_t conversions, C4849 collapse(2) ignored by MSVC OpenMP 2.0, C4293 shift count). No errors.
 - Deviations from plan: None — followed the handoff document exactly.
 
+## [5.1] Full link — all 3 binaries build and run — ec17f30 — PASS
+- Files touched: c/glm.exe (412 KB), c/olmoe.exe (220 KB), c/iobench.exe (164 KB)
+- What changed: All three translation units compile + link under cl /std:c17 /openmp /arch:AVX2 /D_FILE_OFFSET_BITS=64 /experimental:c11atomics. Binaries run without crashing (glm.exe prints "SNAP=<dir>", olmoe.exe prints "set SNAP=<snapshot directory>", iobench.exe prints usage).
+- Compile check result: PASS — all three link successfully with zero errors.
+- Deviations from plan: None.
+
 ## [0.1] Baseline verification — 9c7f6a8 — PASS
 - Files touched: none (verification only)
 - What changed: Confirmed MSVC toolchain works with exact build flags

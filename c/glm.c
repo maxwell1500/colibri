@@ -1624,7 +1624,7 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
 #endif
         if(!cuda_core){
         int s, h;
-        #pragma omp parallel for collapse(2) schedule(static)
+        #pragma omp parallel for collapse(2) schedule(static) private(h)
         for(s=0;s<S;s++) for(h=0;h<H;h++){
             KVState *ks=kvs?kvs[s]:m->kv;
             int pos=positions?positions[s]:pos_base+s;
@@ -1671,7 +1671,7 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
     float *sc_all = falloc((int64_t)omp_get_max_threads()*sc_cap);
     double tac=now_s();
     int s, h;
-    #pragma omp parallel for collapse(2) schedule(static)
+    #pragma omp parallel for collapse(2) schedule(static) private(h)
     for(s=0;s<S;s++) for(h=0;h<H;h++){
         int pos=pos_base+s;
         const float *qp=Q+(int64_t)s*H*qh+(int64_t)h*qh;          /* [qk_nope | qk_rope] */
