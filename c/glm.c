@@ -2659,13 +2659,14 @@ static int spec_decode(Model *m, int *all, int kv, int n_new, int eos, float *lo
 typedef struct { int *dst; int n; } EmitStore;
 static void emit_store(int t, void *ud){ EmitStore *e=(EmitStore*)ud; e->dst[e->n++]=t; }
 /* emit callback: detokenizza e stampa in streaming (chat/run), con heartbeat */
-typedef struct { Tok *T; Model *m; double t0; int count; int quiet; } EmitStream;
+typedef struct { Tok *T; Model *m; double t0; double t_decode; int count; int quiet; } EmitStream;
 static void emit_stream(int t, void *ud){
     EmitStream *e=(EmitStream*)ud; char dec[64];
     int dn=tok_decode(e->T,&t,1,dec,63); dec[dn]=0; fputs(dec,stdout); fflush(stdout);
     if(!e->quiet && ++e->count%16==0){ double tt=e->m->hits+e->m->miss;
-        fprintf(stderr,"\n[t=%d  RSS %.2f GB  hit %.0f%%  %.2f tok/s  %.2f tok/fw]\n", e->count,
+        fprintf(stderr,"\n[t=%d  RSS %.2f GB  hit %.0f%%  %.2f tok/s  decode %.2f tok/s  %.2f tok/fw]\n", e->count,
             rss_gb(), tt?100.0*e->m->hits/tt:0.0, e->count/(now_s()-e->t0),
+            e->t_decode>0?e->count/(now_s()-e->t_decode):0.0,
             e->m->n_fw?(double)e->m->n_emit/e->m->n_fw:1.0); }
 }
 
@@ -2796,14 +2797,16 @@ static void run_text(Model *m, const char *snap, const char *prompt, int ngen){
     int *all=malloc((np+ngen+g_draft+2)*sizeof(int)); memcpy(all,pids,np*sizeof(int));
     double t=now_s();
     float *logit=step(m,pids,np,0);
-    EmitStream es={&T,m,t,0,0};
+    double t_prefill_end=now_s();
+    EmitStream es={&T,m,t,t_prefill_end,0,0};
     grammar_reset();
     int produced=spec_decode(m,all,np,ngen,eos,logit,emit_stream,&es,NULL);
     double dt=now_s()-t;
+    double dt_decode=now_s()-t_prefill_end;
     double tot=m->hits+m->miss;
     int nsp=0; for(int i=0;i<c->n_layers;i++) if(m->L[i].sparse) nsp++;
-    printf("\n---\n%d tokens in %.2fs (%.2f tok/s) | expert hit rate %.1f%% | RSS %.2f GB\n",
-        produced, dt, produced/dt, tot?100.0*m->hits/tot:0.0, rss_gb());
+    printf("\n---\n%d tokens in %.2fs (%.2f tok/s) | decode %.2fs (%.2f tok/s) | expert hit rate %.1f%% | RSS %.2f GB\n",
+        produced, dt, produced/dt, dt_decode, dt_decode>0?produced/dt_decode:0.0, tot?100.0*m->hits/tot:0.0, rss_gb());
     printf("experts loaded/token: %.1f (per-layer %.2f across %d; baseline topk=%d) | TOPK=%d TOPP=%.2f\n",
         produced?(double)m->ereq/produced:0.0, (produced&&nsp)?(double)m->ereq/produced/nsp:0.0, nsp, c->topk, g_topk, g_topp);
     printf("speculation: %.2f tokens/forward (%llu forwards per %llu tokens) | MTP acceptance %.0f%% (%llu/%llu)\n",
