@@ -184,6 +184,7 @@ static int g_cuda_enabled;
 static double g_cuda_expert_gb;
 static int g_cuda_dense;
 static int g_cuda_release_host;
+static int g_cuda_batch_size = 16;
 static int g_cuda_devices[COLI_CUDA_MAX_DEVICES], g_cuda_ndev, g_cuda_rr;
 static int64_t g_cuda_dense_projected[COLI_CUDA_MAX_DEVICES];
 static void qt_cuda_reset(QT *t){
@@ -3430,7 +3431,28 @@ static void pin_load(Model *m, const char *statspath, double gb){
     free(seen);
     qsort(r,(size_t)n,sizeof(*r),pin_rec_cmp);
     int64_t eb=expert_bytes_probe(m,m->ebits);
+#ifdef COLI_CUDA
+    /* Compute VRAM budget BEFORE npin so we can size pin[] for all VRAM candidates */
+    double remaining[COLI_CUDA_MAX_DEVICES]={0}, placed_b[COLI_CUDA_MAX_DEVICES]={0};
+    int placed_n[COLI_CUDA_MAX_DEVICES]={0}, gpu_prefix=0;
+    double budget=0, safe_total=0;
+    if(g_cuda_enabled&&g_cuda_expert_gb>0){
+        budget=g_cuda_expert_gb*1e9;
+        for(int i=0;i<g_cuda_ndev;i++){
+            size_t free_b=0,total_b=0;
+            if(coli_cuda_mem_info(g_cuda_devices[i],&free_b,&total_b)){
+                remaining[i]=(double)free_b-(double)g_cuda_dense_projected[i]-2e9;
+                if(remaining[i]<0) remaining[i]=0; safe_total+=remaining[i];
+            }
+        }
+        if(budget>safe_total) budget=safe_total;
+        if(g_cuda_release_host) gpu_prefix=(int)(budget/eb)+g_cuda_ndev;
+    }
+#else
+    int gpu_prefix=0;
+#endif
     int npin=(int)(gb*1e9/eb); if(npin>n) npin=n;
+    if(gpu_prefix>0 && gpu_prefix>npin) npin=gpu_prefix;  /* CUDA: npin tracks VRAM capacity */
     if(npin<1){ free(r); return; }
     int *cnt_l=calloc(c->n_layers+1,sizeof(int));   /* +1: riga MTP */
     for(int a=0;a<npin;a++) cnt_l[r[a].l]++;
@@ -3439,75 +3461,70 @@ static void pin_load(Model *m, const char *statspath, double gb){
     for(int a=0;a<npin;a++) slot_of[a]=next[r[a].l]++;
     for(int i=0;i<=c->n_layers;i++) m->npin[i]=cnt_l[i];
     double t0=now_s();
+    /* BATCHED VRAM LOADING: load experts in small batches, upload to VRAM,
+     * release host backing, repeat. Peak host RAM = BATCH_SIZE * expert_bytes. */
+    int vram_budget_experts = gpu_prefix;  /* total we WANT in VRAM */
+    int vram_placed = 0;                   /* total PLACED so far */
+
+    for(int batch_start = 0; batch_start < npin; batch_start += g_cuda_batch_size){
+        int batch_end = batch_start + g_cuda_batch_size;
+        if(batch_end > npin) batch_end = npin;
+        int batch_count = batch_end - batch_start;
+
+        /* Phase A: Load this batch into host RAM (parallel pread) */
+        int a;
+        #pragma omp parallel for schedule(dynamic,1)
+        for(a = batch_start; a < batch_end; a++)
+            expert_load(m, r[a].l, r[a].e, &m->pin[r[a].l][slot_of[a]], 1);
+        m->resident_bytes += (int64_t)batch_count * eb;
+
+        /* Phase B: Upload this batch to VRAM, release host backing */
 #ifdef COLI_CUDA
-    double remaining[COLI_CUDA_MAX_DEVICES]={0}, placed_b[COLI_CUDA_MAX_DEVICES]={0};
-    int placed_n[COLI_CUDA_MAX_DEVICES]={0}, gpu_prefix=0;
-    double budget=g_cuda_expert_gb*1e9, safe_total=0;
-    if(g_cuda_enabled&&g_cuda_expert_gb>0) for(int i=0;i<g_cuda_ndev;i++){
-        size_t free_b=0,total_b=0;
-        if(coli_cuda_mem_info(g_cuda_devices[i],&free_b,&total_b)){
-            remaining[i]=(double)free_b-(double)g_cuda_dense_projected[i]-2e9;
-            if(remaining[i]<0) remaining[i]=0; safe_total+=remaining[i];
-        }
-    }
-    if(budget>safe_total) budget=safe_total;
-    if(g_cuda_enabled&&g_cuda_release_host&&budget>0){ gpu_prefix=(int)(budget/eb)+g_cuda_ndev; if(gpu_prefix>npin)gpu_prefix=npin; }
-#else
-    int gpu_prefix=0;
-#endif
-    /* Load the VRAM-ranked prefix first.  Once uploaded its host backing is
-     * released before the disjoint RAM-ranked suffix is allocated. */
-    int a;
-    #pragma omp parallel for schedule(dynamic,1)
-    for(a=0;a<(gpu_prefix?gpu_prefix:npin);a++)
-        expert_load(m,r[a].l,r[a].e,&m->pin[r[a].l][slot_of[a]],1);
-    m->resident_bytes+=(int64_t)(gpu_prefix?gpu_prefix:npin)*eb;
-#ifdef COLI_CUDA
-    if(g_cuda_enabled && g_cuda_expert_gb>0){
-        int gpu_limit=gpu_prefix?gpu_prefix:npin;
-        for(int a=0;a<gpu_limit && m->gpu_expert_bytes<budget;a++){
-            int li=r[a].l;
-            { ESlot *s=&m->pin[li][slot_of[a]];
-                int64_t need=qt_bytes(&s->g)+qt_bytes(&s->u)+qt_bytes(&s->d);
-                if(m->gpu_expert_bytes+need>budget) break;
-                int tried[COLI_CUDA_MAX_DEVICES]={0}, placed=0;
-                for(int attempt=0;attempt<g_cuda_ndev && !placed;attempt++){
-                    int best=-1;
-                    for(int i=0;i<g_cuda_ndev;i++) if(!tried[i] && remaining[i]>=need &&
-                        (best<0||placed_b[i]<placed_b[best])) best=i;
-                    if(best<0) break;
-                    tried[best]=1;
-                    s->g.cuda_device=s->u.cuda_device=s->d.cuda_device=g_cuda_devices[best];
-                    s->g.cuda_eligible=s->u.cuda_eligible=s->d.cuda_eligible=1;
+        if(g_cuda_enabled && m->gpu_expert_bytes < budget){
+            for(a = batch_start; a < batch_end; a++){
+                int li = r[a].l;
+                ESlot *s = &m->pin[li][slot_of[a]];
+                int64_t need = qt_bytes(&s->g) + qt_bytes(&s->u) + qt_bytes(&s->d);
+                if(m->gpu_expert_bytes + need > budget) break;
+
+                int tried[COLI_CUDA_MAX_DEVICES] = {0}, placed = 0;
+                for(int attempt = 0; attempt < g_cuda_ndev && !placed; attempt++){
+                    int best = -1;
+                    for(int i = 0; i < g_cuda_ndev; i++)
+                        if(!tried[i] && remaining[i] >= need &&
+                           (best < 0 || placed_b[i] < placed_b[best]))
+                            best = i;
+                    if(best < 0) break;
+                    tried[best] = 1;
+                    s->g.cuda_device = s->u.cuda_device = s->d.cuda_device = g_cuda_devices[best];
+                    s->g.cuda_eligible = s->u.cuda_eligible = s->d.cuda_eligible = 1;
                     if(qt_cuda_upload(&s->g) && qt_cuda_upload(&s->u) && qt_cuda_upload(&s->d)){
-                        int64_t actual=(int64_t)coli_cuda_tensor_bytes(s->g.cuda)
-                                      +(int64_t)coli_cuda_tensor_bytes(s->u.cuda)
-                                      +(int64_t)coli_cuda_tensor_bytes(s->d.cuda);
-                        m->gpu_expert_count++; m->gpu_expert_bytes+=actual;
-                        remaining[best]-=actual; placed_b[best]+=actual; placed_n[best]++;
+                        int64_t actual = (int64_t)coli_cuda_tensor_bytes(s->g.cuda)
+                                       + (int64_t)coli_cuda_tensor_bytes(s->u.cuda)
+                                       + (int64_t)coli_cuda_tensor_bytes(s->d.cuda);
+                        m->gpu_expert_count++; m->gpu_expert_bytes += actual;
+                        remaining[best] -= actual; placed_b[best] += actual; placed_n[best]++;
                         if(g_cuda_release_host) expert_host_release(m,s);
-                        placed=1;
+                        vram_placed++;
+                        placed = 1;
                     } else {
                         qt_cuda_reset(&s->g); qt_cuda_reset(&s->u); qt_cuda_reset(&s->d);
-                        s->g.cuda_eligible=s->u.cuda_eligible=s->d.cuda_eligible=0;
-                        remaining[best]=0;             /* device rejected its projected capacity */
+                        s->g.cuda_eligible = s->u.cuda_eligible = s->d.cuda_eligible = 0;
+                        remaining[best] = 0;
                     }
                 }
             }
         }
-        fprintf(stderr,"[CUDA] hot expert tier: %d/%d experts, VRAM %.2f GB (total budget %.1f GB)\n",
-            m->gpu_expert_count,npin,m->gpu_expert_bytes/1e9,g_cuda_expert_gb);
-        for(int i=0;i<g_cuda_ndev;i++) fprintf(stderr,"[CUDA]   device %d: %d experts, %.2f GB\n",
-            g_cuda_devices[i],placed_n[i],placed_b[i]/1e9);
-    }
 #endif
-    if(gpu_prefix>0&&gpu_prefix<npin){
-        int a;
-        #pragma omp parallel for schedule(dynamic,1)
-        for(a=gpu_prefix;a<npin;a++)
-            expert_load(m,r[a].l,r[a].e,&m->pin[r[a].l][slot_of[a]],1);
-        m->resident_bytes+=(int64_t)(npin-gpu_prefix)*eb;
+        /* Stop batching if VRAM is full */
+        if(vram_budget_experts > 0 && vram_placed >= vram_budget_experts) break;
     }
+#ifdef COLI_CUDA
+    fprintf(stderr,"[CUDA] hot expert tier: %d/%d experts, VRAM %.2f GB (total budget %.1f GB)\n",
+        m->gpu_expert_count,npin,m->gpu_expert_bytes/1e9,g_cuda_expert_gb);
+    for(int i=0;i<g_cuda_ndev;i++) fprintf(stderr,"[CUDA]   device %d: %d experts, %.2f GB\n",
+        g_cuda_devices[i],placed_n[i],placed_b[i]/1e9);
+#endif
     fprintf(stderr,"[PIN] placement: %d VRAM + %d RAM expert (%.1f GB warm) in %.0fs da %s\n",
         m->gpu_expert_count,npin-m->gpu_expert_count,(npin-m->gpu_expert_count)*eb/1e9,now_s()-t0,statspath);
     pin_wire(m);                                   /* inchioda in RAM (no compressione) / wire in RAM (no compression) */
@@ -3720,6 +3737,9 @@ int main(int argc, char **argv){
     g_cuda_dense=getenv("CUDA_DENSE")?atoi(getenv("CUDA_DENSE")):0;
     g_cuda_expert_gb=getenv("CUDA_EXPERT_GB")?atof(getenv("CUDA_EXPERT_GB")):0;
     g_cuda_release_host=getenv("CUDA_RELEASE_HOST")?atoi(getenv("CUDA_RELEASE_HOST")):(g_cuda_ndev>1);
+    g_cuda_batch_size=getenv("CUDA_BATCH_SIZE")?atoi(getenv("CUDA_BATCH_SIZE")):16;
+    if(g_cuda_batch_size<1) g_cuda_batch_size=1;
+    if(g_cuda_batch_size>64) g_cuda_batch_size=64;
     if((getenv("COLI_GPU")||getenv("COLI_GPUS"))&&!g_cuda_enabled){ fprintf(stderr,"COLI_GPU(S) requires COLI_CUDA=1\n"); return 2; }
     if(g_cuda_dense&&!g_cuda_enabled){ fprintf(stderr,"CUDA_DENSE requires COLI_CUDA=1\n"); return 2; }
     if(g_cuda_expert_gb>0 && !g_cuda_enabled){ fprintf(stderr,"CUDA_EXPERT_GB requires COLI_CUDA=1\n"); return 2; }
