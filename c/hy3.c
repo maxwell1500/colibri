@@ -23,6 +23,10 @@
 #include <sys/resource.h>
 #include <sys/mman.h>
 #endif
+#ifdef _WIN32
+#include <windows.h>
+#include <omp.h>
+#endif
 #if defined(__linux__) && defined(COLI_IOURING)
 #include <liburing.h>
 #endif
@@ -2943,6 +2947,29 @@ int main(int argc, char **argv){
     _setmode(_fileno(stdin),  _O_BINARY);
     _setmode(_fileno(stdout), _O_BINARY);
     setvbuf(stdout, NULL, _IONBF, 0);
+    /* Pin to P-cores only (skip E-cores + HT siblings) */
+    { DWORD_PTR proc_aff, sys_aff;
+      const char *cpu_aff_env = getenv("CPU_AFFINITY");
+      if(cpu_aff_env){ DWORD_PTR m = strtoull(cpu_aff_env, NULL, 16);
+          if(m) SetProcessAffinityMask(GetCurrentProcess(), m);
+      } else if(GetProcessAffinityMask(GetCurrentProcess(), &proc_aff, &sys_aff)){
+          int total = 0; for(DWORD_PTR tmp = sys_aff; tmp; tmp >>= 1) if(tmp & 1) total++;
+          int e_cores = total >= 12 ? 4 : 0; /* hybrid: assume last 4 logical are E-cores */
+          int p_logical = total - e_cores;   /* all P-core logical procs (incl. HT) */
+          DWORD_PTR mask = 0;
+          for(int i = 0, count = 0; i < (int)(sizeof(DWORD_PTR)*8) && count < p_logical; i++)
+              if(sys_aff & ((DWORD_PTR)1 << i)){ mask |= (DWORD_PTR)1 << i; count++; }
+          if(mask && mask != proc_aff){
+              SetProcessAffinityMask(GetCurrentProcess(), mask);
+              fprintf(stderr, "[AFFINITY] pinned to %d/%d logical procs (CPU_AFFINITY to override)\n",
+                  p_logical, total);
+              char omp_env[16]; snprintf(omp_env, sizeof(omp_env), "%d", p_logical);
+              SetEnvironmentVariable("OMP_NUM_THREADS", omp_env);
+              SetEnvironmentVariable("OMP_PROC_BIND", "close");
+              omp_set_num_threads(p_logical);
+          }
+      }
+    }
 #endif    
     const char *snap=getenv("SNAP"); if(!snap){fprintf(stderr,"SNAP=<dir>\n");return 1;}
     g_nopack=getenv("NOPACK")?1:0;
