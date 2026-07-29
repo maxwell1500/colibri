@@ -388,7 +388,7 @@ static void matmul_i2(float *y, const float *x, const uint8_t *q2, const float *
 static int g_idot=1, g_i4s=1, g_nopack=0, g_drop=0, g_direct=1, g_i8slab=0;
 static int g_perf=0, g_kv_i8=0, g_tree_draft=0;
 static int g_prefetch=0;  /* PREFETCH=1: cross-layer expert preload via background thread (experimental) */
-static int g_cache_route=0;  /* CACHE_ROUTE=1: cache-aware routing (max-rank, arXiv 2412.00099) */
+static int g_cache_route=1;  /* CACHE_ROUTE=1: cache-aware routing (max-rank, arXiv 2412.00099) */
 static int g_route_j=2;      /* ROUTE_J: sacred top ranks (always take, even uncached) */
 static int g_route_m=12;     /* ROUTE_M: max-rank window for cache-preferring fill */
 /* DUAL-SSD mirror: second read-only model copy on another drive */
@@ -3004,7 +3004,7 @@ int main(int argc, char **argv){
     if(g_pilot_k<1) g_pilot_k=1;
     g_pilot_evict_guard=getenv("PILOT_EVICT_GUARD")?atoi(getenv("PILOT_EVICT_GUARD")):1;
     if(g_pilot) fprintf(stderr,"[PILOT] on K=%d real=%d (router-lookahead prefetch)\n",g_pilot_k,g_pilot_real);
-    g_cache_route=getenv("CACHE_ROUTE")?atoi(getenv("CACHE_ROUTE")):0;
+    g_cache_route=getenv("CACHE_ROUTE")?atoi(getenv("CACHE_ROUTE")):1;
     g_route_j=getenv("ROUTE_J")?atoi(getenv("ROUTE_J")):2;
     g_route_m=getenv("ROUTE_M")?atoi(getenv("ROUTE_M")):12;
     if(g_cache_route) fprintf(stderr,"[CACHE_ROUTE] on J=%d M=%d (pinΓê¬LRU prefer)\n",g_route_j,g_route_m);
