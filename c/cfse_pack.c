@@ -132,14 +132,23 @@ int main(int argc,char**argv){
     int64_t rawtot=0, comptot=0;
     for(int i=0;i<NE;i++){
         size_t rn=(size_t)(E[i].b-E[i].a);
-        blob[i]=xmalloc(cfse_bound(rn));
-        bn[i]=cfse_compress((uint8_t*)in+ds+E[i].a,rn,blob[i],cfse_bound(rn));
-        if(!bn[i]){ fprintf(stderr,"%s: compress fallita su %s\n",inp,E[i].name); return 1; }
-        /* paranoia in linea: round-trip IMMEDIATO prima di scrivere qualsiasi cosa */
-        uint8_t *chk=xmalloc(rn); size_t rl=0;
-        if(cfse_decompress(blob[i],bn[i],chk,rn,&rl)||rl!=rn||memcmp(chk,in+ds+E[i].a,rn)){
-            fprintf(stderr,"ABORT: self-check fallito su %s — nessun file scritto\n",E[i].name); return 1; }
-        free(chk); rawtot+=(int64_t)rn; comptot+=(int64_t)bn[i];
+        int is_u8=!strcmp(E[i].dtype,"U8")||!strcmp(E[i].dtype,"I8");
+        if(is_u8){
+            blob[i]=xmalloc(cfse_bound(rn));
+            bn[i]=cfse_compress((uint8_t*)in+ds+E[i].a,rn,blob[i],cfse_bound(rn));
+            if(!bn[i]){ fprintf(stderr,"%s: compress fallita su %s\n",inp,E[i].name); return 1; }
+            uint8_t *chk=xmalloc(rn); size_t rl=0;
+            if(cfse_decompress(blob[i],bn[i],chk,rn,&rl)||rl!=rn||memcmp(chk,in+ds+E[i].a,rn)){
+                fprintf(stderr,"ABORT: self-check fallito su %s — nessun file scritto\n",E[i].name); return 1; }
+            free(chk);
+            comptot+=(int64_t)bn[i];
+        } else {
+            blob[i]=xmalloc(rn);
+            memcpy(blob[i],in+ds+E[i].a,rn);
+            bn[i]=rn;
+            comptot+=(int64_t)rn;
+        }
+        rawtot+=(int64_t)rn;
     }
 
     /* header JSON: __metadata__.cfse=1 + tensori con offset compressi (ordine originale) */

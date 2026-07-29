@@ -142,6 +142,8 @@ typedef struct {
 typedef struct {
     int eid; QT g,u,d; uint8_t *slab; float *fslab;
     int64_t slab_cap, fslab_cap; uint64_t used;
+    uint8_t *cfse_tmp; int64_t cfse_tmp_cap;
+    int8_t *i8slab; int64_t i8slab_cap;
 } ESlot;
 
 typedef struct {
@@ -159,6 +161,7 @@ typedef struct {
     uint64_t eclock, hits, miss, ereq;
     uint32_t **eusage;
     uint32_t **eheat;
+    uint32_t **elast; uint64_t eaccess_clock;
     /* testa MTP (layer n_layers, stile DeepSeek-V3): draft nativi ad alta acceptance */
     int has_mtp; Layer mtpL; QT eh_proj;
     float *enorm, *hnorm, *mtp_norm;
@@ -170,10 +173,16 @@ typedef struct {
     double t_edisk, t_emm, t_attn, t_head;
     uint8_t *attn_vis;                           /* TREE_DRAFT: mask [S][max_t] flattened */
     int attn_vis_s;
+    uint64_t route_slots, route_swaps;           /* CACHE_ROUTE accounting */
+    uint64_t route_agree_hit, route_agree_tot;   /* ROUTE_AGREE telemetry */
 } Model;
 
 static void perf_report(Model *m);
 
+static float g_vram_bias = 0;
+static float g_ram_bias_ratio = 0.5f;
+static int g_warm_window = 0;
+static int g_cuda_release_host = 0;
 #ifdef COLI_CUDA
 static int g_cuda_enabled;
 static double g_cuda_expert_gb;
@@ -181,6 +190,8 @@ static int g_cuda_dense;
 static int g_cuda_attn;
 static int g_cuda_devices[COLI_CUDA_MAX_DEVICES], g_cuda_ndev, g_cuda_rr;
 static int64_t g_cuda_dense_projected[COLI_CUDA_MAX_DEVICES];
+static ColiCudaTensor *g_stage_gate=NULL, *g_stage_up=NULL, *g_stage_down=NULL;
+static int g_staging_failed=0;
 static void qt_cuda_reset(QT *t){
     if(t->cuda){ coli_cuda_tensor_free(t->cuda); t->cuda=NULL; }
     t->cuda_failed=0;
@@ -189,6 +200,30 @@ static int qt_cuda_upload(QT *t){
     const void *weights = t->fmt==0 ? (const void*)t->qf
                         : t->fmt==1 ? (const void*)t->q8 : (const void*)t->q4;
     return coli_cuda_tensor_upload(&t->cuda,weights,t->s,t->fmt,t->I,t->O,t->cuda_device);
+}
+static int expert_gpu_stage_compute(float *hh, const float *xg, ESlot *e, int nr, int device){
+    if(g_staging_failed) return 0;
+    const void *gw=e->g.fmt==0?(const void*)e->g.qf:e->g.fmt==1?(const void*)e->g.q8:(const void*)e->g.q4;
+    const void *uw=e->u.fmt==0?(const void*)e->u.qf:e->u.fmt==1?(const void*)e->u.q8:(const void*)e->u.q4;
+    const void *dw=e->d.fmt==0?(const void*)e->d.qf:e->d.fmt==1?(const void*)e->d.q8:(const void*)e->d.q4;
+    if(!gw||!uw||!dw){ g_staging_failed=1; return 0; }
+    if(!g_stage_gate){
+        if(!coli_cuda_tensor_upload(&g_stage_gate,gw,e->g.s,e->g.fmt,e->g.I,e->g.O,device)||
+           !coli_cuda_tensor_upload(&g_stage_up,uw,e->u.s,e->u.fmt,e->u.I,e->u.O,device)||
+           !coli_cuda_tensor_upload(&g_stage_down,dw,e->d.s,e->d.fmt,e->d.I,e->d.O,device)){
+            g_staging_failed=1; return 0;
+        }
+    } else {
+        if(!coli_cuda_tensor_update(g_stage_gate,gw,e->g.s)||
+           !coli_cuda_tensor_update(g_stage_up,uw,e->u.s)||
+           !coli_cuda_tensor_update(g_stage_down,dw,e->d.s)){
+            g_staging_failed=1; return 0;
+        }
+    }
+    if(!coli_cuda_expert_mlp(g_stage_gate,g_stage_up,g_stage_down,hh,xg,nr)){
+        g_staging_failed=1; return 0;
+    }
+    return 1;
 }
 static void cuda_stats_print(void){
     size_t n=0,b=0; coli_cuda_stats(-1,&n,&b);
@@ -215,6 +250,17 @@ static int parse_cuda_devices(const char *list, int *out){
     return n;
 }
 #endif
+
+/* CFSE entropy-coded expert weights ΓÇö disabled for debugging */
+#ifdef USE_ZSTD
+#include <zstd.h>
+#endif
+static int g_cfse = 0;
+static int cfse_decompress(const uint8_t *in, size_t nin, uint8_t *out, size_t cap, size_t *rawlen){
+    (void)in;(void)nin;(void)out;(void)cap;(void)rawlen; return -1;
+}
+static int64_t st_peek_decompressed_size(shards *S, const char *name){ (void)S; (void)name; return -1; }
+static int64_t st_read_cfse(shards *S, const char *name, void *out, int64_t cap, size_t *rawlen){ (void)S; (void)name; (void)out; (void)cap; if(rawlen)*rawlen=0; return 0; }
 
 static float g_temp=-1;
 static float g_nuc=0.90f;
@@ -335,8 +381,18 @@ static void matmul_i2(float *y, const float *x, const uint8_t *q2, const float *
             y[(int64_t)s*O+o]=a*sc; } }
 }
 
-static int g_idot=1, g_i4s=2, g_nopack=0, g_drop=0, g_direct=0;
+static int g_idot=1, g_i4s=1, g_nopack=0, g_drop=0, g_direct=1, g_i8slab=0;
 static int g_perf=0, g_kv_i8=0, g_tree_draft=0;
+static int g_prefetch=0;  /* PREFETCH=1: cross-layer expert preload via background thread (experimental) */
+static int g_cache_route=0;  /* CACHE_ROUTE=1: cache-aware routing (max-rank, arXiv 2412.00099) */
+static int g_route_j=2;      /* ROUTE_J: sacred top ranks (always take, even uncached) */
+static int g_route_m=12;     /* ROUTE_M: max-rank window for cache-preferring fill */
+/* DUAL-SSD mirror: second read-only model copy on another drive */
+static const char *g_mirror_dir=NULL;
+static int g_mirror=0;
+static int g_mir_share=64;  /* expert share routed to mirror, out of 256 */
+static _Atomic int64_t g_mir_bytes[2];  /* [0]=primary, [1]=mirror */
+static _Atomic int64_t g_mir_nread[2];
 static inline float qrow_i8(const float *x, int8_t *q, int I){
     float amax=0; for(int i=0;i<I;i++){ float a=fabsf(x[i]); if(a>amax)amax=a; }
     float s=amax/127.f; if(s<1e-12f)s=1e-12f; float inv=1.f/s;
@@ -348,10 +404,34 @@ static inline int hsum256_i32(__m256i v){
     lo=_mm_add_epi32(lo,hi); lo=_mm_hadd_epi32(lo,lo); lo=_mm_hadd_epi32(lo,lo);
     return _mm_cvtsi128_si32(lo);
 }
+static inline int hsum128_i32(__m128i v){
+    v=_mm_hadd_epi32(v,v); v=_mm_hadd_epi32(v,v);
+    return _mm_cvtsi128_si32(v);
+}
 #endif
 static inline int32_t dot_i8i8(const int8_t *w, const int8_t *x, int I){
     int32_t sum=0;
-#ifdef __AVX2__
+#if defined(__AVXVNNI__) && defined(__AVX2__)
+    int i=0; __m128i a0=_mm_setzero_si128(),a1=_mm_setzero_si128(),a2=_mm_setzero_si128(),a3=_mm_setzero_si128();
+    for(;i+64<=I;i+=64){
+        __m128i w0=_mm_loadu_si128((const __m128i*)(w+i)), x0=_mm_loadu_si128((const __m128i*)(x+i));
+        __m128i w1=_mm_loadu_si128((const __m128i*)(w+i+16)), x1=_mm_loadu_si128((const __m128i*)(x+i+16));
+        __m128i w2=_mm_loadu_si128((const __m128i*)(w+i+32)), x2=_mm_loadu_si128((const __m128i*)(x+i+32));
+        __m128i w3=_mm_loadu_si128((const __m128i*)(w+i+48)), x3=_mm_loadu_si128((const __m128i*)(x+i+48));
+        a0=_mm_dpbusd_epi32(a0,_mm_abs_epi8(w0),_mm_sign_epi8(x0,w0));
+        a1=_mm_dpbusd_epi32(a1,_mm_abs_epi8(w1),_mm_sign_epi8(x1,w1));
+        a2=_mm_dpbusd_epi32(a2,_mm_abs_epi8(w2),_mm_sign_epi8(x2,w2));
+        a3=_mm_dpbusd_epi32(a3,_mm_abs_epi8(w3),_mm_sign_epi8(x3,w3));
+    }
+    __m128i acc=_mm_add_epi32(_mm_add_epi32(a0,a1),_mm_add_epi32(a2,a3));
+    for(;i+16<=I;i+=16){
+        __m128i wv=_mm_loadu_si128((const __m128i*)(w+i));
+        __m128i xv=_mm_loadu_si128((const __m128i*)(x+i));
+        acc=_mm_dpbusd_epi32(acc,_mm_abs_epi8(wv),_mm_sign_epi8(xv,wv));
+    }
+    sum=hsum128_i32(acc);
+    for(;i<I;i++) sum+=(int32_t)w[i]*x[i];
+#elif defined(__AVX2__)
     __m256i acc=_mm256_setzero_si256(); const __m256i ones=_mm256_set1_epi16(1);
     int i=0;
     for(;i+32<=I;i+=32){
@@ -382,9 +462,94 @@ static inline int32_t dot_i8i8(const int8_t *w, const int8_t *x, int I){
     return sum;
 }
 static inline int32_t dot_i4i8(const uint8_t *w4, const int8_t *x, int I){
-    int32_t sum=0;
-    for(int i=0;i+1<I;i+=2){ uint8_t b=w4[i>>1]; sum+=((int)(b&0xF)-8)*x[i]+((int)(b>>4)-8)*x[i+1]; }
-    if(I&1){ uint8_t b=w4[I>>1]; sum+=((int)(b&0xF)-8)*x[I-1]; }
+    int32_t sum=0; int i=0;
+#if defined(__AVXVNNI__) && defined(__AVX2__)
+    const __m128i m4=_mm_set1_epi8(0x0F); const __m128i b8=_mm_set1_epi8(8);
+    __m128i a0=_mm_setzero_si128(),a1=_mm_setzero_si128(),a2=_mm_setzero_si128(),a3=_mm_setzero_si128();
+    for(;i+64<=I;i+=64){
+        __m128i by0=_mm_loadu_si128((const __m128i*)(w4+(i>>1)));
+        __m128i by1=_mm_loadu_si128((const __m128i*)(w4+(i>>1)+16));
+        __m128i lo0=_mm_and_si128(by0,m4), hi0=_mm_and_si128(_mm_srli_epi16(by0,4),m4);
+        __m128i lo1=_mm_and_si128(by1,m4), hi1=_mm_and_si128(_mm_srli_epi16(by1,4),m4);
+        __m128i w0=_mm_sub_epi8(_mm_unpacklo_epi8(lo0,hi0),b8), w1=_mm_sub_epi8(_mm_unpackhi_epi8(lo0,hi0),b8);
+        __m128i w2=_mm_sub_epi8(_mm_unpacklo_epi8(lo1,hi1),b8), w3=_mm_sub_epi8(_mm_unpackhi_epi8(lo1,hi1),b8);
+        __m128i x0=_mm_loadu_si128((const __m128i*)(x+i)),     x1=_mm_loadu_si128((const __m128i*)(x+i+16));
+        __m128i x2=_mm_loadu_si128((const __m128i*)(x+i+32)), x3=_mm_loadu_si128((const __m128i*)(x+i+48));
+        a0=_mm_dpbusd_epi32(a0,_mm_abs_epi8(w0),_mm_sign_epi8(x0,w0));
+        a1=_mm_dpbusd_epi32(a1,_mm_abs_epi8(w1),_mm_sign_epi8(x1,w1));
+        a2=_mm_dpbusd_epi32(a2,_mm_abs_epi8(w2),_mm_sign_epi8(x2,w2));
+        a3=_mm_dpbusd_epi32(a3,_mm_abs_epi8(w3),_mm_sign_epi8(x3,w3));
+    }
+    __m128i acc=_mm_add_epi32(_mm_add_epi32(a0,a1),_mm_add_epi32(a2,a3));
+    for(;i+32<=I;i+=32){
+        __m128i by=_mm_loadu_si128((const __m128i*)(w4+(i>>1)));
+        __m128i lo=_mm_and_si128(by,m4), hi=_mm_and_si128(_mm_srli_epi16(by,4),m4);
+        __m128i w0=_mm_sub_epi8(_mm_unpacklo_epi8(lo,hi),b8), w1=_mm_sub_epi8(_mm_unpackhi_epi8(lo,hi),b8);
+        __m128i x0=_mm_loadu_si128((const __m128i*)(x+i));
+        __m128i x1=_mm_loadu_si128((const __m128i*)(x+i+16));
+        acc=_mm_dpbusd_epi32(acc,_mm_abs_epi8(w0),_mm_sign_epi8(x0,w0));
+        acc=_mm_dpbusd_epi32(acc,_mm_abs_epi8(w1),_mm_sign_epi8(x1,w1));
+    }
+    sum=hsum128_i32(acc);
+    for(;i<I;i++){ uint8_t b=w4[i>>1]; sum+=((int)((b>>((i&1)*4))&0xF)-8)*x[i]; }
+#elif defined(__AVX2__)
+    const __m128i m4=_mm_set1_epi8(0x0F); const __m256i b8=_mm256_set1_epi8(8);
+    const __m256i ones=_mm256_set1_epi16(1);
+    __m256i acc=_mm256_setzero_si256();
+    for(;i+32<=I;i+=32){
+        __m128i by=_mm_loadu_si128((const __m128i*)(w4+(i>>1)));
+        __m128i lo=_mm_and_si128(by,m4), hi=_mm_and_si128(_mm_srli_epi16(by,4),m4);
+        __m128i n0=_mm_unpacklo_epi8(lo,hi), n1=_mm_unpackhi_epi8(lo,hi);
+        __m256i wv=_mm256_sub_epi8(_mm256_set_m128i(n1,n0),b8);
+        __m256i xv=_mm256_loadu_si256((const __m256i*)(x+i));
+        __m256i p=_mm256_maddubs_epi16(_mm256_sign_epi8(wv,wv),_mm256_sign_epi8(xv,wv));
+        acc=_mm256_add_epi32(acc,_mm256_madd_epi16(p,ones));
+    }
+    sum=hsum256_i32(acc);
+    for(;i<I;i++){ uint8_t b=w4[i>>1]; sum+=((int)((b>>((i&1)*4))&0xF)-8)*x[i]; }
+#elif defined(__ARM_NEON)
+    const uint8x16_t m4q=vdupq_n_u8(0x0F); const int8x16_t b8q=vdupq_n_s8(8);
+#if defined(__ARM_FEATURE_DOTPROD)
+    int32x4_t a0=vdupq_n_s32(0),a1=vdupq_n_s32(0),a2=vdupq_n_s32(0),a3=vdupq_n_s32(0);
+    for(;i+64<=I;i+=64){
+        uint8x16_t byA=vld1q_u8(w4+(i>>1)), byB=vld1q_u8(w4+(i>>1)+16);
+        uint8x16x2_t zA=vzipq_u8(vandq_u8(byA,m4q), vshrq_n_u8(byA,4));
+        uint8x16x2_t zB=vzipq_u8(vandq_u8(byB,m4q), vshrq_n_u8(byB,4));
+        a0=vdotq_s32(a0,vsubq_s8(vreinterpretq_s8_u8(zA.val[0]),b8q),vld1q_s8(x+i));
+        a1=vdotq_s32(a1,vsubq_s8(vreinterpretq_s8_u8(zA.val[1]),b8q),vld1q_s8(x+i+16));
+        a2=vdotq_s32(a2,vsubq_s8(vreinterpretq_s8_u8(zB.val[0]),b8q),vld1q_s8(x+i+32));
+        a3=vdotq_s32(a3,vsubq_s8(vreinterpretq_s8_u8(zB.val[1]),b8q),vld1q_s8(x+i+48));
+    }
+    int32x4_t acc=vaddq_s32(vaddq_s32(a0,a1),vaddq_s32(a2,a3));
+    for(;i+32<=I;i+=32){
+        uint8x16_t by=vld1q_u8(w4+(i>>1));
+        uint8x16x2_t z=vzipq_u8(vandq_u8(by,m4q), vshrq_n_u8(by,4));
+        acc=vdotq_s32(acc,vsubq_s8(vreinterpretq_s8_u8(z.val[0]),b8q),vld1q_s8(x+i));
+        acc=vdotq_s32(acc,vsubq_s8(vreinterpretq_s8_u8(z.val[1]),b8q),vld1q_s8(x+i+16));
+    }
+    sum=vaddvq_s32(acc);
+#else
+    int32x4_t acc=vdupq_n_s32(0);
+    for(;i+32<=I;i+=32){
+        uint8x16_t by=vld1q_u8(w4+(i>>1));
+        uint8x16x2_t z=vzipq_u8(vandq_u8(by,m4q), vshrq_n_u8(by,4));
+        int8x16_t w0=vsubq_s8(vreinterpretq_s8_u8(z.val[0]),b8q);
+        int8x16_t w1=vsubq_s8(vreinterpretq_s8_u8(z.val[1]),b8q);
+        int8x16_t x0=vld1q_s8(x+i), x1=vld1q_s8(x+i+16);
+        int16x8_t p=vmull_s8(vget_low_s8(w0),vget_low_s8(x0));
+        p=vmlal_s8(p,vget_high_s8(w0),vget_high_s8(x0));
+        acc=vpadalq_s16(acc,p);
+        p=vmull_s8(vget_low_s8(w1),vget_low_s8(x1));
+        p=vmlal_s8(p,vget_high_s8(w1),vget_high_s8(x1));
+        acc=vpadalq_s16(acc,p);
+    }
+    sum=vaddvq_s32(acc);
+#endif
+    for(;i<I;i++){ uint8_t b=w4[i>>1]; sum+=((int)((b>>((i&1)*4))&0xF)-8)*x[i]; }
+#else
+    for(;i+1<I;i+=2){ uint8_t b=w4[i>>1]; sum+=((int)(b&0xF)-8)*x[i]+((int)(b>>4)-8)*x[i+1]; }
+    if(i<I){ uint8_t b=w4[i>>1]; sum+=((int)(b&0xF)-8)*x[i]; }
+#endif
     return sum;
 }
 static void matmul_q_idot(float *y, const int8_t *xq, const float *sx, const int8_t *q,
@@ -411,12 +576,55 @@ static void quant_scratch(size_t xn, size_t sn, int8_t **xq, float **sx){
     *xq=g_qscratch.xq; *sx=g_qscratch.sx;
 }
 
+/* Fused gate+up: quantize x to int8 ONCE, compute both outputs.
+ * Saves the redundant quantization (qrow_i8) and improves cache locality
+ * by reading x only once from memory. */
+static void matmul_i4_idot_pair(float *yg, float *yu, const float *x,
+                               const uint8_t *qg, const float *sg,
+                               const uint8_t *qu, const float *su,
+                               int S, int I, int O){
+    int rb=(I+1)/2;
+    int8_t *xq; float *sx;
+    quant_scratch((size_t)S*I,(size_t)S,&xq,&sx);
+    for(int s=0;s<S;s++) sx[s]=qrow_i8(x+(int64_t)s*I,xq+(int64_t)s*I,I);
+    #pragma omp parallel for schedule(static)
+    for(int o=0;o<O;o++){
+        const uint8_t *wg=qg+(int64_t)o*rb, *wu=qu+(int64_t)o*rb;
+        float scg=sg[o], scu=su[o];
+        for(int s=0;s<S;s++){
+            const int8_t *xs=xq+(int64_t)s*I;
+            yg[(int64_t)s*O+o]=(float)dot_i4i8(wg,xs,I)*scg*sx[s];
+            yu[(int64_t)s*O+o]=(float)dot_i4i8(wu,xs,I)*scu*sx[s];
+        }
+    }
+}
+
+/* Same fusion for int8 weights (fmt==1, pre-dequanted) */
+static void matmul_q_idot_pair(float *yg, float *yu, const float *x,
+                               const int8_t *qg, const float *sg,
+                               const int8_t *qu, const float *su,
+                               int S, int I, int O){
+    int8_t *xq; float *sx;
+    quant_scratch((size_t)S*I,(size_t)S,&xq,&sx);
+    for(int s=0;s<S;s++) sx[s]=qrow_i8(x+(int64_t)s*I,xq+(int64_t)s*I,I);
+    #pragma omp parallel for schedule(static)
+    for(int o=0;o<O;o++){
+        const int8_t *wg=qg+(int64_t)o*I, *wu=qu+(int64_t)o*I;
+        float scg=sg[o], scu=su[o];
+        for(int s=0;s<S;s++){
+            const int8_t *xs=xq+(int64_t)s*I;
+            yg[(int64_t)s*O+o]=(float)dot_i8i8(wg,xs,I)*scg*sx[s];
+            yu[(int64_t)s*O+o]=(float)dot_i8i8(wu,xs,I)*scu*sx[s];
+        }
+    }
+}
+
 static void matmul_qt(float *y, const float *x, QT *w, int S){
 #ifdef COLI_CUDA
     if(g_cuda_enabled && w->cuda_eligible && !w->cuda_failed && !omp_in_parallel()){
         const void *weights = w->fmt==0 ? (const void*)w->qf
                             : w->fmt==1 ? (const void*)w->q8 : (const void*)w->q4;
-        if(coli_cuda_matmul(&w->cuda,y,x,weights,w->s,w->fmt,S,w->I,w->O,w->cuda_device)) return;
+        if(coli_cuda_matmul(&w->cuda,y,x,weights,w->s,w->fmt,S,w->I,w->O,w->cuda_device,0)) return;
         w->cuda_failed=1;
         fprintf(stderr,COLI_ACCEL_TAG " tensor [%d,%d] on device %d disabled after an error; falling back to CPU\n",
             w->O,w->I,w->cuda_device);
@@ -594,12 +802,15 @@ static void load_cfg(Cfg *c, const char *snap){
 static void qt_from_disk(Model *m, const char *name, int O, int I, int bits, int drop, QT *t){
     char sn[300]; snprintf(sn,sizeof(sn),"%s.qs",name);
     if(st_has(&m->S,sn)){
-        int64_t nb=st_nbytes(&m->S,name);
-        int fmt=(nb==(int64_t)O*I)?1:(nb==(int64_t)O*((I+1)/2))?2:3;
-        if(fmt==1){ if(t->fmt!=1||!t->q8){ t->fmt=1; t->O=O; t->I=I; t->q8=malloc(nb); t->s=falloc(O); }
-            st_read_raw(&m->S,name,t->q8,drop); }
-        else { if(t->fmt!=fmt||!t->q4){ t->fmt=fmt; t->O=O; t->I=I; t->q4=malloc(nb); t->s=falloc(O); }
-            st_read_raw(&m->S,name,t->q4,drop); }
+        int64_t raw_nb=st_nbytes(&m->S,name); int fmt;
+        if(g_cfse) raw_nb=st_peek_decompressed_size(&m->S,name);
+        fmt=(raw_nb==(int64_t)O*I)?1:(raw_nb==(int64_t)O*((I+1)/2))?2:3;
+        if(fmt==1){ if(t->fmt!=1||!t->q8){ t->fmt=1; t->O=O; t->I=I; t->q8=malloc(raw_nb); t->s=falloc(O); }
+            if(g_cfse){ size_t rl=0; st_read_cfse(&m->S,name,t->q8,raw_nb,&rl); }
+            else st_read_raw(&m->S,name,t->q8,drop); }
+        else { if(t->fmt!=fmt||!t->q4){ t->fmt=fmt; t->O=O; t->I=I; t->q4=malloc(raw_nb); t->s=falloc(O); }
+            if(g_cfse){ size_t rl=0; st_read_cfse(&m->S,name,t->q4,raw_nb,&rl); }
+            else st_read_raw(&m->S,name,t->q4,drop); }
         st_read_f32(&m->S,sn,t->s,drop);
     } else {
         if(!t->qf&&!t->q8&&!t->q4) qt_alloc(t,O,I,bits);
@@ -655,8 +866,8 @@ static void embed_row(Model *m, int tok, float *x){
 static void expert_finalize(Model *m, int layer, int eid, ESlot *s,
         st_tensor *tw[3], st_tensor *tq[3], const int ord[3], const int64_t pos[3]){
     Cfg *c=&m->c; int I=c->moe_inter, D=c->hidden;
-    int64_t wtot=tw[0]->nbytes+tw[1]->nbytes+tw[2]->nbytes;
-    if(g_drop){
+    if(g_drop&&!g_cfse){
+        int64_t wtot=tw[0]->nbytes+tw[1]->nbytes+tw[2]->nbytes;
         posix_fadvise(tw[ord[0]]->fd,tw[ord[0]]->off,wtot,POSIX_FADV_DONTNEED);
         for(int k=0;k<3;k++) posix_fadvise(tq[k]->fd,tq[k]->off,tq[k]->nbytes,POSIX_FADV_DONTNEED);
     }
@@ -664,12 +875,72 @@ static void expert_finalize(Model *m, int layer, int eid, ESlot *s,
     for(int k=0;k<3;k++){ fp[k]=s->fslab+fo; fo+=tq[k]->nbytes/4; }
     QT *qt[3]={&s->g,&s->u,&s->d}; int OO[3]={I,I,D}, II[3]={D,D,I};
     for(int k=0;k<3;k++){
-        int64_t nb=tw[k]->nbytes;
-        int fmt=(nb==(int64_t)OO[k]*II[k])?1:(nb==(int64_t)OO[k]*((II[k]+1)/2))?2:3;
+        int64_t raw_nb = tw[k]->nbytes;
+        if(g_cfse && raw_nb>=8){
+            uint8_t hdr[9];
+            st_pread_full(tw[k]->fd, hdr, 9, tw[k]->off, "peek hdr");
+            if(memcmp(hdr,"CFS1",4)==0)
+                raw_nb = (int64_t)((uint32_t)hdr[5]|(uint32_t)hdr[6]<<8|(uint32_t)hdr[7]<<16|(uint32_t)hdr[8]<<24);
+            else if(memcmp(hdr,"ZSTD",4)==0)
+                raw_nb = (int64_t)((uint32_t)hdr[4]|(uint32_t)hdr[5]<<8|(uint32_t)hdr[6]<<16|(uint32_t)hdr[7]<<24);
+        }
+        int fmt;
+        fmt=(raw_nb==(int64_t)OO[k]*II[k])?1:(raw_nb==(int64_t)OO[k]*((II[k]+1)/2))?2:3;
         qt[k]->fmt=fmt; qt[k]->O=OO[k]; qt[k]->I=II[k]; qt[k]->qf=NULL;
         qt[k]->q8=(int8_t*)(s->slab+pos[k]); qt[k]->q4=s->slab+pos[k]; qt[k]->s=fp[k];
     }
     s->eid=eid; (void)layer; (void)m;
+}
+
+static void unpack_i4_row_to_i8(const uint8_t *q4, int8_t *q8, int O, int I){
+    int rb=(I+1)/2;
+    for(int o=0;o<O;o++){ const uint8_t *src=q4+(int64_t)o*rb; int8_t *dst=q8+(int64_t)o*I;
+        for(int i=0;i+1<I;i+=2){ uint8_t b=src[i>>1];
+            dst[i]=(int8_t)((int)(b&0xF)-8); dst[i+1]=(int8_t)((int)(b>>4)-8); }
+        if(I&1) dst[I-1]=(int8_t)((int)(src[I>>1]&0xF)-8);
+    }
+}
+
+/* DUAL-SSD: deterministic hash of (layer,eid) to route experts to drives.
+ * Determinism is required so readahead and demand reads hit the same fd. */
+static inline int expert_route(int layer,int eid){
+    if(!g_mirror) return 0;
+    uint32_t h=(uint32_t)layer*2654435761u ^ (uint32_t)eid*0x9E3779B9u;
+    h^=h>>16; h*=0x45d9f3bu; h^=h>>16;
+    return (int)(h&255) < g_mir_share;
+}
+
+/* pread on the chosen replica with fallback to primary on error */
+static int mir_pread(shards *S,int fd,int rep,void *buf,int64_t n,int64_t off,const char *tag){
+    int rfd=st_fd_rep(S,fd,rep);
+    int used=rep && rfd>=0;
+    if(rfd<0) rfd=fd;
+    char *p=buf; int64_t got=0;
+    while(got<n){
+        ssize_t r=pread(rfd,p+got,(size_t)(n-got),off+got);
+        if(r<0){ if(errno==EINTR) continue;
+            if(used){ used=0; rfd=fd; continue; }
+            fprintf(stderr,"%s: %s (off %lld, %lld/%lld)\n",tag,strerror(errno),
+                (long long)off,(long long)got,(long long)n); exit(1); }
+        if(r==0) break;
+        got+=r;
+    }
+    if(got!=(int64_t)n && used){ /* mirror short read: retry on primary */
+        used=0; rfd=fd; got=0;
+        while(got<n){
+            ssize_t r=pread(rfd,p+got,(size_t)(n-got),off+got);
+            if(r<0){ if(errno==EINTR) continue;
+                fprintf(stderr,"%s: primary fallback failed: %s\n",tag,strerror(errno)); exit(1); }
+            if(r==0) break; got+=r;
+        }
+        static _Atomic int warned;
+        if(!atomic_exchange(&warned,1))
+            fprintf(stderr,"[MIRROR] read error on the mirror copy ΓÇö falling back to the primary drive\n");
+    }
+    if(got!=(int64_t)n){ fprintf(stderr,"%s: short read %lld/%lld\n",tag,(long long)got,(long long)n); exit(1); }
+    atomic_fetch_add_explicit(&g_mir_bytes[used],n,memory_order_relaxed);
+    atomic_fetch_add_explicit(&g_mir_nread[used],1,memory_order_relaxed);
+    return 0;
 }
 
 static int expert_load(Model *m, int layer, int eid, ESlot *s){
@@ -692,7 +963,23 @@ static int expert_load(Model *m, int layer, int eid, ESlot *s){
         snprintf(qn,sizeof(qn),"%s.qs",nm[k]); tq[k]=st_find(&m->S,qn);
         if(!tw[k]||!tq[k]){ fprintf(stderr,"missing %s\n",nm[k]); exit(1); }
     }
-    int64_t wtot=tw[0]->nbytes+tw[1]->nbytes+tw[2]->nbytes;
+    int rep=expert_route(layer,eid);
+    if(rep && st_fd_rep(&m->S,tw[0]->fd,1)<0) rep=0;  /* shard not in mirror (partial) */
+    int64_t raw_sz[3];
+    if(g_cfse){
+        uint8_t hdr[9];
+        for(int k=0;k<3;k++){
+            if(pread(tw[k]->fd,hdr,9,tw[k]->off)!=9){perror("pread cfse hdr");exit(1);}
+            if(memcmp(hdr,"CFS1",4)==0){
+                raw_sz[k]=(int64_t)((uint32_t)hdr[5]|(uint32_t)hdr[6]<<8|(uint32_t)hdr[7]<<16|(uint32_t)hdr[8]<<24);
+            } else if(memcmp(hdr,"ZSTD",4)==0){
+                raw_sz[k]=(int64_t)((uint32_t)hdr[4]|(uint32_t)hdr[5]<<8|(uint32_t)hdr[6]<<16|(uint32_t)hdr[7]<<24);
+            } else {
+                raw_sz[k]=tw[k]->nbytes;
+            }
+        }
+    }
+    int64_t wtot = g_cfse ? (raw_sz[0]+raw_sz[1]+raw_sz[2]) : (tw[0]->nbytes+tw[1]->nbytes+tw[2]->nbytes);
     int64_t ftot=(tq[0]->nbytes+tq[1]->nbytes+tq[2]->nbytes)/4;
     if(!s->slab||wtot+8192>s->slab_cap){
         compat_aligned_free(s->slab);
@@ -700,46 +987,125 @@ static int expert_load(Model *m, int layer, int eid, ESlot *s){
         s->slab_cap=wtot+8192;
     }
     if(!s->fslab||ftot>s->fslab_cap){ free(s->fslab); s->fslab=falloc(ftot); s->fslab_cap=ftot; }
-    int ord[3]={0,1,2};
-    for(int a=0;a<3;a++) for(int bb=a+1;bb<3;bb++) if(tw[ord[bb]]->off<tw[ord[a]]->off){ int t=ord[a]; ord[a]=ord[bb]; ord[bb]=t; }
-    int contig=tw[ord[0]]->fd==tw[ord[1]]->fd&&tw[ord[1]]->fd==tw[ord[2]]->fd
-        &&tw[ord[0]]->off+tw[ord[0]]->nbytes==tw[ord[1]]->off
-        &&tw[ord[1]]->off+tw[ord[1]]->nbytes==tw[ord[2]]->off;
-    int64_t pos[3]; int done=0;
-    if(contig){
-        int64_t off0=tw[ord[0]]->off;
-        int dfd=g_direct?st_direct_fd(&m->S,tw[ord[0]]->fd):-1;
-        if(dfd>=0){
-            int64_t base=off0&~4095LL, need=(off0-base)+wtot, len=(need+4095)&~4095LL;
-            if(pread(dfd,s->slab,len,base)>=need){
-                pos[ord[0]]=off0-base; pos[ord[1]]=pos[ord[0]]+tw[ord[0]]->nbytes;
-                pos[ord[2]]=pos[ord[1]]+tw[ord[1]]->nbytes; done=1;
+    int64_t pos[3];
+    if(g_cfse){
+        int64_t o=0;
+        for(int k=0;k<3;k++){
+            if(!s->cfse_tmp || s->cfse_tmp_cap < (int64_t)tw[k]->nbytes){
+                free(s->cfse_tmp);
+                s->cfse_tmp = malloc((size_t)tw[k]->nbytes);
+                if (!s->cfse_tmp) { fprintf(stderr, "OOM cfse tmp %lld\n", (long long)tw[k]->nbytes); exit(1); }
+                s->cfse_tmp_cap = (int64_t)tw[k]->nbytes;
+            }
+            st_pread_full(tw[k]->fd, s->cfse_tmp, tw[k]->nbytes, tw[k]->off, "pread cfse");
+            size_t rl=0;
+            if(memcmp(s->cfse_tmp,"CFS1",4)==0){
+                if(cfse_decompress(s->cfse_tmp,tw[k]->nbytes,s->slab+o,raw_sz[k],&rl)){
+                    fprintf(stderr,"CFSE decompress fail %s: compressed=%lld raw_sz=%lld\n",nm[k],(long long)tw[k]->nbytes,(long long)raw_sz[k]);exit(1);}
+                if(rl!=(size_t)raw_sz[k]){fprintf(stderr,"CFSE size %s: got %zu expect %lld\n",nm[k],rl,(long long)raw_sz[k]);exit(1);}
+#ifdef USE_ZSTD
+            } else if(memcmp(s->cfse_tmp,"ZSTD",4)==0){
+                size_t dlen=ZSTD_decompress(s->slab+o,(size_t)raw_sz[k],s->cfse_tmp+8,(size_t)tw[k]->nbytes-8);
+                if(ZSTD_isError(dlen)){fprintf(stderr,"ZSTD decompress fail %s: %s\n",nm[k],ZSTD_getErrorName(dlen));exit(1);}
+                if(dlen!=(size_t)raw_sz[k]){fprintf(stderr,"ZSTD size %s: got %zu expect %lld\n",nm[k],dlen,(long long)raw_sz[k]);exit(1);}
+#endif
+            } else {
+                size_t cp=(size_t)tw[k]->nbytes < (size_t)raw_sz[k] ? (size_t)tw[k]->nbytes : (size_t)raw_sz[k];
+                memcpy(s->slab+o,s->cfse_tmp,cp);
+                if((size_t)raw_sz[k] > cp) memset(s->slab+o+cp,0,(size_t)(raw_sz[k]-cp));
+            }
+            pos[k]=o; o+=raw_sz[k];
+        }
+    } else {
+        int ord[3]={0,1,2};
+        for(int a=0;a<3;a++) for(int bb=a+1;bb<3;bb++) if(tw[ord[bb]]->off<tw[ord[a]]->off){ int t=ord[a]; ord[a]=ord[bb]; ord[bb]=t; }
+        int contig=tw[ord[0]]->fd==tw[ord[1]]->fd&&tw[ord[1]]->fd==tw[ord[2]]->fd
+            &&tw[ord[0]]->off+tw[ord[0]]->nbytes==tw[ord[1]]->off
+            &&tw[ord[1]]->off+tw[ord[1]]->nbytes==tw[ord[2]]->off;
+        int done=0; int64_t opos[3];
+        if(contig){
+            int64_t off0=tw[ord[0]]->off;
+            int dfd=g_direct?st_direct_fd(&m->S,tw[ord[0]]->fd):-1;
+            if(dfd>=0){
+                int64_t base=off0&~4095LL, need=(off0-base)+wtot, len=(need+4095)&~4095LL;
+                if(pread(dfd,s->slab,len,base)>=need){
+                    opos[ord[0]]=off0-base; opos[ord[1]]=opos[ord[0]]+tw[ord[0]]->nbytes;
+                    opos[ord[2]]=opos[ord[1]]+tw[ord[1]]->nbytes; done=1;
+                }
+            }
+            if(!done){
+                mir_pread(&m->S,tw[ord[0]]->fd,rep,s->slab,wtot,off0,"pread expert");
+                opos[ord[0]]=0; opos[ord[1]]=tw[ord[0]]->nbytes; opos[ord[2]]=opos[ord[1]]+tw[ord[1]]->nbytes; done=1;
             }
         }
-        if(!done){
-            if(pread(tw[ord[0]]->fd,s->slab,wtot,off0)!=wtot){perror("pread expert");exit(1);}
-            pos[ord[0]]=0; pos[ord[1]]=tw[ord[0]]->nbytes; pos[ord[2]]=tw[ord[0]]->nbytes+tw[ord[1]]->nbytes; done=1;
+        if(!done){ int64_t o=0;
+            for(int a=0;a<3;a++){ int k=ord[a];
+                mir_pread(&m->S,tw[k]->fd,rep,s->slab+o,tw[k]->nbytes,tw[k]->off,"pread expert");
+                opos[k]=o; o+=tw[k]->nbytes; }
         }
-    }
-    if(!done){ int64_t o=0;
-        for(int a=0;a<3;a++){ int k=ord[a];
-            if(pread(tw[k]->fd,s->slab+o,tw[k]->nbytes,tw[k]->off)!=tw[k]->nbytes){perror("pread expert");exit(1);}
-            pos[k]=o; o+=tw[k]->nbytes; }
+        for(int k=0;k<3;k++) pos[k]=opos[k];
     }
     int64_t fo=0;
     for(int k=0;k<3;k++){
-        if(pread(tq[k]->fd,(char*)(s->fslab+fo),tq[k]->nbytes,tq[k]->off)!=tq[k]->nbytes){perror("pread qs");exit(1);}
+        mir_pread(&m->S,tq[k]->fd,rep,(char*)(s->fslab+fo),tq[k]->nbytes,tq[k]->off,"pread qs");
         fo+=tq[k]->nbytes/4;
     }
     if(g_drop){
-        posix_fadvise(tw[ord[0]]->fd,tw[ord[0]]->off,wtot,POSIX_FADV_DONTNEED);
+        if(!g_cfse){
+            posix_fadvise(tw[0]->fd,tw[0]->off,wtot,POSIX_FADV_DONTNEED);
+        }
         for(int k=0;k<3;k++) posix_fadvise(tq[k]->fd,tq[k]->off,tq[k]->nbytes,POSIX_FADV_DONTNEED);
     }
-    expert_finalize(m,layer,eid,s,tw,tq,ord,pos);
+    { Cfg *c__=&m->c; int I__=c__->moe_inter, D__=c__->hidden;
+        if(g_drop&&!g_cfse){
+            int64_t wtot=tw[0]->nbytes+tw[1]->nbytes+tw[2]->nbytes;
+            posix_fadvise(tw[0]->fd,tw[0]->off,wtot,POSIX_FADV_DONTNEED);
+            for(int k=0;k<3;k++) posix_fadvise(tq[k]->fd,tq[k]->off,tq[k]->nbytes,POSIX_FADV_DONTNEED);
+        }
+        float *fp__[3]; int64_t fo__=0;
+        for(int k=0;k<3;k++){ fp__[k]=s->fslab+fo__; fo__+=tq[k]->nbytes/4; }
+        QT *qt__[3]={&s->g,&s->u,&s->d}; int OO__[3]={I__,I__,D__}, II__[3]={D__,D__,I__};
+        for(int k=0;k<3;k++){
+            int64_t raw_nb = tw[k]->nbytes;
+            if(g_cfse && raw_nb>=8){
+                uint8_t hdr[9];
+                st_pread_full(tw[k]->fd, hdr, 9, tw[k]->off, "peek hdr");
+                if(memcmp(hdr,"CFS1",4)==0)
+                    raw_nb = (int64_t)((uint32_t)hdr[5]|(uint32_t)hdr[6]<<8|(uint32_t)hdr[7]<<16|(uint32_t)hdr[8]<<24);
+                else if(memcmp(hdr,"ZSTD",4)==0)
+                    raw_nb = (int64_t)((uint32_t)hdr[4]|(uint32_t)hdr[5]<<8|(uint32_t)hdr[6]<<16|(uint32_t)hdr[7]<<24);
+            }
+            int fmt;
+            fmt=(raw_nb==(int64_t)OO__[k]*II__[k])?1:(raw_nb==(int64_t)OO__[k]*((II__[k]+1)/2))?2:3;
+            qt__[k]->fmt=fmt; qt__[k]->O=OO__[k]; qt__[k]->I=II__[k]; qt__[k]->qf=NULL;
+            qt__[k]->q8=(int8_t*)(s->slab+pos[k]); qt__[k]->q4=s->slab+pos[k]; qt__[k]->s=fp__[k];
+        }
+        s->eid=eid;
+    }
+    
+    /* Pre-dequant int4ΓåÆint8: trades 3├ù more RAM per expert for faster matmul.
+     * When disabled (g_i8slab=0), experts stay int4 in ecache ΓåÆ 3├ù more slots,
+     * and matmul_i4_idot uses AVX-VNNI dot_i4i8 (nibble unpack + dpbusd inline). */
+    if(g_i8slab){
+        int64_t i8tot=0; QT *qt[3]={&s->g,&s->u,&s->d};
+        for(int k=0;k<3;k++) if(qt[k]->fmt==2) i8tot+=(int64_t)qt[k]->O*qt[k]->I;
+        if(i8tot>0){
+            if(!s->i8slab||i8tot>s->i8slab_cap){ free(s->i8slab);
+                s->i8slab=(int8_t*)malloc(i8tot); if(!s->i8slab){fprintf(stderr,"OOM i8slab\n");exit(1);} s->i8slab_cap=i8tot; }
+            int64_t off=0;
+            for(int k=0;k<3;k++){
+                if(qt[k]->fmt!=2) continue;
+                unpack_i4_row_to_i8(qt[k]->q4,s->i8slab+off,qt[k]->O,qt[k]->I);
+                qt[k]->fmt=1; qt[k]->q8=s->i8slab+off;
+                off+=(int64_t)qt[k]->O*qt[k]->I;
+            }
+        }
+    }
+    
     return 1;
 }
 
-static int g_pipe=0, g_pipe_nw=8;
+static int g_pipe=0, g_pipe_nw=8, g_pipe_block=0;
 
 #if defined(__linux__) && defined(COLI_IOURING)
 typedef struct {
@@ -871,7 +1237,7 @@ static void uring_pipe_wait(int q){
 typedef struct {
     _Atomic uint64_t cur;
     _Atomic int njobs, eids[64], layer, ready[64];
-    pthread_mutex_t mx; pthread_cond_t cv;
+    pthread_mutex_t mx; pthread_cond_t cv, cv_done;
     Model *m; pthread_t th[16]; int nw, started;
 } PipePool;
 static PipePool g_pp;
@@ -892,6 +1258,11 @@ static void *pipe_worker(void *arg){
                 int eid=atomic_load_explicit(&p->eids[i],memory_order_relaxed);
                 expert_load(p->m,L,eid,&p->m->ws[i]);
                 atomic_store_explicit(&p->ready[i],1,memory_order_release);
+                if(g_pipe_block){
+                    pthread_mutex_lock(&p->mx);
+                    pthread_cond_broadcast(&p->cv_done);
+                    pthread_mutex_unlock(&p->mx);
+                }
             }
         }
     }
@@ -910,6 +1281,7 @@ static void pipe_init(Model *m){
     g_pp.m=m; g_pp.nw=g_pipe_nw; if(g_pp.nw>16)g_pp.nw=16; if(g_pp.nw<1)g_pp.nw=1;
     atomic_store(&g_pp.cur,0); atomic_store(&g_pp.njobs,0);
     pthread_mutex_init(&g_pp.mx,NULL); pthread_cond_init(&g_pp.cv,NULL);
+    pthread_cond_init(&g_pp.cv_done,NULL);
     for(int i=0;i<g_pp.nw;i++) pthread_create(&g_pp.th[i],NULL,pipe_worker,NULL);
     g_pp.started=1;
 }
@@ -930,6 +1302,14 @@ static inline void pipe_wait(int q){
 #if defined(__linux__) && defined(COLI_IOURING)
     if(g_pipe==2){ uring_pipe_wait(q); return; }
 #endif
+    if(g_pipe_block){
+        if(atomic_load_explicit(&g_pp.ready[q],memory_order_acquire)) return;
+        pthread_mutex_lock(&g_pp.mx);
+        while(!atomic_load_explicit(&g_pp.ready[q],memory_order_acquire))
+            pthread_cond_wait(&g_pp.cv_done,&g_pp.mx);
+        pthread_mutex_unlock(&g_pp.mx);
+        return;
+    }
     while(!atomic_load_explicit(&g_pp.ready[q],memory_order_acquire)) sched_yield();
 }
 
@@ -939,6 +1319,136 @@ static void expert_prefetch(Model *m, int layer, int eid){
         snprintf(nm,sizeof(nm),"model.layers.%d.mlp.experts.%d.%s",layer,eid,suf[k]); st_prefetch(&m->S,nm);
         char qs[320]; snprintf(qs,sizeof(qs),"%s.qs",nm); st_prefetch(&m->S,qs);
     }
+}
+
+/* ============================ PILOT: router-lookahead prefetch ============================
+ * While layer L computes (MoE matmul + disk I/O), a background thread loads the
+ * predicted hot experts for layer L+1 into ecache.  When the main thread reaches
+ * L+1's MoE those experts are already in RAM ΓåÆ no disk wait.
+ * Prediction: run L+1's router on L's post-attention state (71.6% recall on GLM).
+ * PILOT_REAL: actually load the expert (pread) into the future layer's ecache.
+ * g_cur_moe_layer: barrier ΓÇö pilot won't touch layers the main thread has entered. */
+
+static int g_pilot=0;       /* PILOT=1: router-lookahead prefetch */
+static int g_pilot_real=1;  /* PILOT_REAL=1: real loads into ecache (default ON) */
+static int g_pilot_k=6;     /* PILOT_K: top-K predictions to prefetch */
+static int g_pilot_evict_guard=1; /* protect warm experts from speculative eviction */
+static _Atomic int g_cur_moe_layer=-1;
+static pthread_mutex_t g_pilot_mx=PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_pilot_cv=PTHREAD_COND_INITIALIZER;
+static int g_pilot_inflight[256];
+static _Atomic long g_pilot_loads=0, g_pilot_drops=0;
+
+static struct { int l,e; } pilot_q[4096];
+static volatile unsigned pilot_w=0, pilot_r=0;
+static Model *pilot_m=NULL;
+
+static int expert_is_resident(Model *m, int layer, int eid){
+    ESlot *P=m->pin[layer];
+    for(int z=0;z<m->npin[layer];z++) if(P[z].eid==eid) return 1;
+    ESlot *Sl=m->ecache[layer];
+    for(int z=0;z<m->ecn[layer];z++) if(Sl[z].eid==eid) return 1;
+    return 0;
+}
+
+/* PILOT_REAL: real load of predicted expert into the FUTURE layer's ecache.
+ * The pread runs OUTSIDE the lock; the lock protects only slot selection and
+ * the cross-layer handshake. fatal=0: a speculative I/O error never kills the process. */
+static void pilot_realload(Model *m, int layer, int eid){
+    pthread_mutex_lock(&g_pilot_mx);
+    if(layer <= atomic_load_explicit(&g_cur_moe_layer,memory_order_acquire)){
+        atomic_fetch_add_explicit(&g_pilot_drops,1,memory_order_relaxed);
+        pthread_mutex_unlock(&g_pilot_mx); return;
+    }
+    ESlot *P=m->pin[layer];
+    for(int z=0;z<m->npin[layer];z++) if(P[z].eid==eid){ pthread_mutex_unlock(&g_pilot_mx); return; }
+    ESlot *Sl=m->ecache[layer]; int nn=m->ecn[layer];
+    for(int z=0;z<nn;z++) if(Sl[z].eid==eid){ pthread_mutex_unlock(&g_pilot_mx); return; }
+    int slot,isnew;
+    if(nn<m->ecap){ slot=nn; isnew=1; }
+    else { int lru=0; for(int z=1;z<nn;z++) if(Sl[z].used<Sl[lru].used) lru=z; slot=lru; isnew=0;
+        if(g_pilot_evict_guard && m->eheat && m->elast && Sl[lru].eid>=0){
+            int vid=Sl[lru].eid; uint32_t vh=m->eheat[layer][vid];
+            if(vh>=2){
+                uint64_t vs=tier_lfru_score(vh,m->elast[layer][vid],m->eaccess_clock);
+                uint64_t cs=tier_lfru_score(m->eheat[layer][eid],m->elast[layer][eid],m->eaccess_clock);
+                if(vs+(vs>>2)+(4u<<8)>cs){ atomic_fetch_add_explicit(&g_pilot_drops,1,memory_order_relaxed);
+                                            pthread_mutex_unlock(&g_pilot_mx); return; } } }
+    }
+    ESlot *dst=&Sl[slot];
+    dst->eid=-1;  /* hide from scan while loading */
+    g_pilot_inflight[layer]++;
+    pthread_mutex_unlock(&g_pilot_mx);
+
+    expert_load(m,layer,eid,dst);  /* pread ΓÇö outside lock, overlapped with compute */
+
+    pthread_mutex_lock(&g_pilot_mx);
+    dst->used=++m->eclock;
+    if(isnew) m->ecn[layer]=slot+1;
+    atomic_fetch_add_explicit(&g_pilot_loads,1,memory_order_relaxed);
+    g_pilot_inflight[layer]--;
+    pthread_cond_broadcast(&g_pilot_cv);
+    pthread_mutex_unlock(&g_pilot_mx);
+}
+
+static void *pilot_worker(void *arg){
+    (void)arg;
+    for(;;){
+        unsigned r=__atomic_load_n(&pilot_r,__ATOMIC_ACQUIRE);
+        unsigned w=__atomic_load_n(&pilot_w,__ATOMIC_ACQUIRE);
+        if(r==w){ sched_yield(); continue; }
+        if(g_pilot_real)
+            pilot_realload(pilot_m, pilot_q[r&4095].l, pilot_q[r&4095].e);
+        else
+            expert_prefetch(pilot_m, pilot_q[r&4095].l, pilot_q[r&4095].e);
+        __atomic_store_n(&pilot_r,r+1,__ATOMIC_RELEASE);
+    }
+    return NULL;
+}
+
+static void pilot_ensure_started(Model *m){
+    if(!pilot_m){ pilot_m=m; pthread_t t; pthread_create(&t,NULL,pilot_worker,NULL); }
+}
+
+/* Run the FUTURE layer's router on the current post-attention state to predict
+ * which experts it will need. Enqueue the top-K non-resident predictions. */
+static void pilot_prefetch(Model *m, int lnext, const float *x, int S){
+    Cfg *c=&m->c; Layer *l=&m->L[lnext]; int D=c->hidden, E=c->n_experts;
+    int K = g_pilot_k<c->topk ? g_pilot_k : c->topk;
+    if(K<1) K=1;
+    pilot_ensure_started(m);
+    float *nrm=falloc(D), *ch=falloc(E);
+    for(int s=0;s<S;s++){
+        const float *xs = x+(int64_t)s*D;
+        rmsnorm(nrm, xs, l->post_ln, D, c->eps);
+        matmul(ch, nrm, l->router, 1, D, E);
+        for(int e=0;e<E;e++) ch[e]=sigmoidf(ch[e])+l->router_bias[e];
+        for(int kk=0;kk<K;kk++){
+            int best=0; for(int e=1;e<E;e++) if(ch[e]>ch[best]) best=e;
+            ch[best]=-2e30f;
+            int found=0;
+            pthread_mutex_lock(&g_pilot_mx);
+            ESlot *P=m->pin[lnext];
+            for(int z=0;z<m->npin[lnext] && !found;z++) if(P[z].eid==best) found=1;
+            ESlot *Sl=m->ecache[lnext];
+            for(int z=0;z<m->ecn[lnext] && !found;z++)
+                if(Sl[z].eid==best || Sl[z].eid==-(best+2)) found=1;
+            pthread_mutex_unlock(&g_pilot_mx);
+            if(!found){
+                unsigned w=__atomic_load_n(&pilot_w,__ATOMIC_RELAXED);
+                if(w-__atomic_load_n(&pilot_r,__ATOMIC_ACQUIRE)<4096){
+                    pilot_q[w&4095].l=lnext; pilot_q[w&4095].e=best;
+                    __atomic_store_n(&pilot_w,w+1,__ATOMIC_RELEASE);
+                }
+            }
+        }
+    }
+    free(nrm); free(ch);
+}
+
+static void prefetch_stop(void){
+    /* pilot_worker runs forever; no need to join (process exit handles it) */
+    (void)0;
 }
 
 static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits){
@@ -959,6 +1469,7 @@ static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits
     m->pin=calloc(nrows,sizeof(ESlot*)); m->npin=calloc(nrows,sizeof(int));
     m->eusage=calloc(nrows,sizeof(uint32_t*));
     m->eheat=calloc(nrows,sizeof(uint32_t*));
+    m->elast=calloc(nrows,sizeof(uint32_t*));
     for(int i=0;i<c->n_layers;i++){
         Layer *l=&m->L[i];
         #define P(s) (snprintf(nm,sizeof(nm),"model.layers.%d." s,i),nm)
@@ -995,6 +1506,7 @@ static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits
             m->ecache[i]=calloc(cap,sizeof(ESlot));
             m->eusage[i]=calloc(c->n_experts,sizeof(uint32_t));
             m->eheat[i]=calloc(c->n_experts,sizeof(uint32_t));
+            m->elast[i]=calloc(c->n_experts,sizeof(uint32_t));
         }
         #undef P
     }
@@ -1068,6 +1580,7 @@ static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits
             m->ecache[i]=calloc(cap,sizeof(ESlot));
             m->eusage[i]=calloc(c->n_experts,sizeof(uint32_t));
             m->eheat[i]=calloc(c->n_experts,sizeof(uint32_t));
+            m->elast[i]=calloc(c->n_experts,sizeof(uint32_t));
             #undef PM
         }
     }
@@ -1234,23 +1747,170 @@ static void dense_mlp(Layer *l, float *x, int S, int D, int I, float *out){
     free(g); free(u);
 }
 
+/* When CUDA_RELEASE_HOST is set, free host memory for GPU-resident experts */
+static void expert_host_release(Model *m, ESlot *s){
+    if(!s->slab&&!s->fslab) return;
+    int64_t bytes=qt_bytes(&s->g)+qt_bytes(&s->u)+qt_bytes(&s->d);
+    compat_aligned_free(s->slab); free(s->fslab); free(s->cfse_tmp); free(s->i8slab);
+    s->slab=NULL; s->fslab=NULL; s->slab_cap=s->fslab_cap=0; s->cfse_tmp=NULL; s->cfse_tmp_cap=0; s->i8slab=NULL; s->i8slab_cap=0;
+    QT *q[3]={&s->g,&s->u,&s->d};
+    for(int k=0;k<3;k++){ q[k]->qf=NULL; q[k]->q8=NULL; q[k]->q4=NULL; q[k]->s=NULL; }
+    m->resident_bytes-=bytes; if(m->resident_bytes<0) m->resident_bytes=0;
+}
+
+/* DUAL-SSD: measure one replica's read bandwidth with the engine's own access
+ * pattern (parallel ~19 MB reads, O_DIRECT twin when available). */
+static double mirror_probe_bw(shards *S,int rep){
+    int big=-1; int64_t bsz=0;
+    for(int i=0;i<S->nfd;i++){
+        if(rep && S->mfds[i]<0) continue;
+        int64_t sz=lseek(rep?S->mfds[i]:S->fds[i],0,SEEK_END);
+        if(sz>bsz){ bsz=sz; big=i; }
+    }
+    const int64_t blk=19ll<<20; const int NB=8;
+    if(big<0 || bsz<blk*(NB+1)) return 0;
+    int dfd = rep? S->mdfds[big] : S->dfds[big];
+    int fd  = dfd>=0? dfd : (rep? S->mfds[big] : S->fds[big]);
+    if(dfd<0) fprintf(stderr,"[MIRROR] no O_DIRECT on %s: the probe may read the page cache ΓÇö "
+                             "set COLI_DISK_WEIGHTS for an accurate split\n", rep?"the mirror":"the primary");
+    double t0=now_s(); int64_t tot=0;
+    #pragma omp parallel for schedule(dynamic,1) reduction(+:tot)
+    for(int i=0;i<NB;i++){
+        void *buf;
+        if(!posix_memalign(&buf,4096,blk)){
+            int64_t off=(((bsz-blk)/NB)*i) & ~4095ll;
+            ssize_t r=pread(fd,buf,blk,off);
+            if(r>0) tot+=r;
+            compat_aligned_free(buf);
+        }
+    }
+    double dt=now_s()-t0;
+    return (dt>0 && tot>0)? tot/1e9/dt : 0;
+}
+
+/* DUAL-SSD setup: register the mirror copy, derive the read split from
+ * COLI_DISK_WEIGHTS=<primary>,<mirror> or from a startup bandwidth probe. */
+static void mirror_setup(Model *m){
+    if(!g_mirror_dir) return;
+    const char *snap=getenv("SNAP");
+    if(snap && !strcmp(snap,g_mirror_dir)){
+        fprintf(stderr,"[MIRROR] mirror dir equals the model dir ΓÇö ignored\n"); return;
+    }
+    int nf=st_mirror_init(&m->S,g_mirror_dir);
+    if(nf<=0){
+        fprintf(stderr,"[MIRROR] %s: no usable shard (missing or divergent copy) ΓÇö "
+                       "running on the primary drive only\n",g_mirror_dir);
+        return;
+    }
+    g_mirror=1;
+    double wp=0,wm=0; const char *w=getenv("COLI_DISK_WEIGHTS"); const char *how="COLI_DISK_WEIGHTS";
+    if(w && (sscanf(w," %lf , %lf",&wp,&wm)!=2 || wp<=0 || wm<=0)){
+        fprintf(stderr,"[MIRROR] invalid COLI_DISK_WEIGHTS '%s' (want e.g. 9,3) ΓÇö probing instead\n",w);
+        wp=wm=0;
+    }
+    if(wp<=0||wm<=0){
+        wp=mirror_probe_bw(&m->S,0); wm=mirror_probe_bw(&m->S,1); how="measured";
+        if(wp>0&&wm>0) fprintf(stderr,"[MIRROR] probe: primary %.2f GB/s, mirror %.2f GB/s\n",wp,wm);
+        else { wp=wm=1; how="fallback 1:1 (probe failed)"; }
+    }
+    int share=(int)(256.0*wm/(wp+wm)+0.5);
+    g_mir_share = share<1?1 : share>255?255 : share;
+    fprintf(stderr,"[MIRROR] %s: %d/%d shards | read split primary %.0f%% / mirror %.0f%% (%s)\n",
+        g_mirror_dir,nf,m->S.nfd,100.0*(256-g_mir_share)/256,100.0*g_mir_share/256,how);
+}
+
+/* Check if expert `eid` is warm (in pin, ecache, or recently accessed) */
+static int is_warm(Model *m, int layer, int eid){
+    ESlot *P=m->pin[layer];
+    for(int z=0;z<m->npin[layer];z++) if(P[z].eid==eid) return 1;
+    ESlot *Sl=m->ecache[layer];
+    for(int z=0;z<m->ecn[layer];z++) if(Sl[z].eid==eid) return 1;
+    if(g_warm_window>0 && m->elast[layer] &&
+       m->elast[layer][eid]>(uint64_t)(m->eaccess_clock-g_warm_window)) return 1;
+    return 0;
+}
+
 /* MoE: HYV3TopKRouter math (sigmoid, bias for selection, normalize, router_scaling_factor) */
 static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
+    /* PILOT_REAL barrier: take ownership of this layer and wait for any
+     * pilot loads still in flight on it. After this, the pilot worker
+     * drops any new load <= g_cur_moe_layer, so ecache[layer] is stable. */
+    if(g_pilot_real){
+        pthread_mutex_lock(&g_pilot_mx);
+        atomic_store_explicit(&g_cur_moe_layer,layer,memory_order_release);
+        while(layer>=0 && layer<256 && g_pilot_inflight[layer]>0)
+            pthread_cond_wait(&g_pilot_cv,&g_pilot_mx);
+        pthread_mutex_unlock(&g_pilot_mx);
+    }
     Cfg *c=&m->c; int D=c->hidden, E=c->n_experts, K=c->topk, I=c->moe_inter;
     int sI=c->moe_inter*c->n_shared;
     float *logit=falloc(E), *choice=falloc(E);
     int *idxs=malloc((size_t)S*K*sizeof(int)); float *ws=malloc((size_t)S*K*sizeof(float));
     int *keff=malloc(S*sizeof(int));
+    uint8_t *warm_tier=NULL;
+    if(g_vram_bias>0){
+        warm_tier=calloc(1,(size_t)E);
+        ESlot *P=m->pin[layer];
+        for(int z=0;z<m->npin[layer];z++) if(P[z].eid<E)
+            warm_tier[P[z].eid]=P[z].g.cuda_eligible?2:1;
+        ESlot *Sl=m->ecache[layer];
+        for(int z=0;z<m->ecn[layer];z++) if(Sl[z].eid<E&&!warm_tier[Sl[z].eid])
+            warm_tier[Sl[z].eid]=1;
+        if(g_warm_window>0&&m->elast[layer])
+            for(int e=0;e<E;e++) if(!warm_tier[e]&&
+                m->elast[layer][e]>(uint64_t)(m->eaccess_clock-g_warm_window))
+                warm_tier[e]=1;
+    }
     for(int s=0;s<S;s++){
         const float *xs=x+(int64_t)s*D;
         matmul(logit,xs,l->router,1,D,E);
         for(int e=0;e<E;e++){ logit[e]=sigmoidf(logit[e]); choice[e]=logit[e]+l->router_bias[e]; }
+        /* VRAM_BIAS: tiered boost ΓÇö VRAM experts get full bias, RAM-only pin half */
+        if(warm_tier){
+            for(int e=0;e<E;e++){
+                if(warm_tier[e]==2) choice[e]+=g_vram_bias;
+                else if(warm_tier[e]==1) choice[e]+=g_vram_bias*g_ram_bias_ratio;
+            }
+        }
         int *idx=idxs+(int64_t)s*K; float *w=ws+(int64_t)s*K;
         int Ksel=g_topk>0?(g_topk<K?g_topk:K):K;
-        for(int kk=0;kk<Ksel;kk++){ int best=-1; float bv=-1e30f;
-            for(int e=0;e<E;e++){ int tk=0; for(int j=0;j<kk;j++) if(idx[j]==e){tk=1;break;}
-                if(!tk&&choice[e]>bv){bv=choice[e];best=e;} }
-            idx[kk]=best; w[kk]=logit[best];
+        if(g_cache_route && E>0 && K>0){
+            /* CACHE_ROUTE: keep true top-J, fill remaining from cache-resident within top-M */
+            int Mwin=g_route_m>Ksel?g_route_m:Ksel; if(Mwin>E) Mwin=E;
+            int J=g_route_j; if(J<0) J=0; if(J>Ksel) J=Ksel;
+            int rank_buf[256]; float rank_w[256]; if(Mwin>256) Mwin=256;
+            for(int kk=0;kk<Mwin;kk++){ int best=-1; float bv=-1e30f;
+                for(int e=0;e<E;e++){ int tk=0; for(int j=0;j<kk;j++) if(rank_buf[j]==e){tk=1;break;}
+                    if(!tk&&choice[e]>bv){bv=choice[e];best=e;} }
+                rank_buf[kk]=best; rank_w[kk]=logit[best];
+            }
+            int chosen=0;
+            for(int kk=0;kk<J && chosen<Ksel;kk++){ idx[chosen]=rank_buf[kk]; w[chosen]=rank_w[kk]; chosen++; }
+            for(int r=J;r<Mwin && chosen<Ksel;r++){
+                int e=rank_buf[r]; int already=0;
+                for(int j=0;j<chosen;j++) if(idx[j]==e){already=1;break;}
+                if(already) continue;
+                if(expert_is_resident(m,layer,e)){ idx[chosen]=e; w[chosen]=rank_w[r]; chosen++; }
+            }
+            for(int r=0;r<Mwin && chosen<Ksel;r++){
+                int e=rank_buf[r]; int already=0;
+                for(int j=0;j<chosen;j++) if(idx[j]==e){already=1;break;}
+                if(already) continue;
+                idx[chosen]=e; w[chosen]=rank_w[r]; chosen++;
+            }
+            while(chosen<Ksel){ idx[chosen]=rank_buf[chosen]; w[chosen]=rank_w[chosen]; chosen++; }
+            m->route_slots+=(uint64_t)Ksel;
+            for(int kk=0;kk<Ksel;kk++){ int e=idx[kk], in_true=0;
+                for(int t=0;t<Ksel;t++) if(rank_buf[t]==e){in_true=1;break;}
+                if(!in_true) m->route_swaps++; }
+            int ov=0; for(int kk=0;kk<Ksel;kk++) for(int t=0;t<Ksel;t++) if(idx[kk]==rank_buf[t]){ov++;break;}
+            m->route_agree_hit+=(uint64_t)ov; m->route_agree_tot+=(uint64_t)Ksel;
+        } else {
+            for(int kk=0;kk<Ksel;kk++){ int best=-1; float bv=-1e30f;
+                for(int e=0;e<E;e++){ int tk=0; for(int j=0;j<kk;j++) if(idx[j]==e){tk=1;break;}
+                    if(!tk&&choice[e]>bv){bv=choice[e];best=e;} }
+                idx[kk]=best; w[kk]=logit[best];
+            }
         }
         int Ke=Ksel;
         if(g_topp>0 && g_topp<1.f){
@@ -1263,6 +1923,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
         for(int kk=0;kk<Ke;kk++){
             if(m->eusage[layer]) m->eusage[layer][idx[kk]]++;
             if(m->eheat[layer]&&m->eheat[layer][idx[kk]]<UINT32_MAX) m->eheat[layer][idx[kk]]++;
+            if(m->elast[layer]) m->elast[layer][idx[kk]]=++m->eaccess_clock;
         }
         if(c->route_norm){ float sm=1e-20f; for(int kk=0;kk<Ke;kk++) sm+=w[kk]; for(int kk=0;kk<Ke;kk++) w[kk]/=sm; }
         for(int kk=0;kk<Ke;kk++) w[kk]*=c->router_scale;
@@ -1310,13 +1971,29 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
                 if(idxs[(int64_t)s*K+kk]==eid){ rows[nr]=s; rw[nr]=ws[(int64_t)s*K+kk]; nr++; break; }
             if(!nr) continue;
 #ifdef COLI_CUDA
-            if(g_cuda_enabled && e->g.cuda_eligible) m->gpu_expert_calls++;
+            int gpu_call=0;
+            if(g_cuda_enabled && e->g.cuda_eligible){ m->gpu_expert_calls++; gpu_call=1; }
 #endif
             for(int r=0;r<nr;r++) memcpy(xg+(int64_t)r*D,x+(int64_t)rows[r]*D,D*sizeof(float));
             double t0=now_s();
-            matmul_qt(gg,xg,&e->g,nr); matmul_qt(uu,xg,&e->u,nr);
-            for(int64_t z=0;z<(int64_t)nr*I;z++) gg[z]=siluf(gg[z])*uu[z];
-            matmul_qt(hh,gg,&e->d,nr);
+#ifdef COLI_CUDA
+            if(g_cuda_enabled && !gpu_call && !omp_in_parallel() &&
+               expert_gpu_stage_compute(hh,xg,e,nr,g_cuda_devices[0])){
+                m->gpu_expert_calls++;
+            } else
+#endif
+            {
+                /* Fused gate+up: quantize x once, compute both with same xq */
+                if(g_idot && e->g.fmt==2 && e->u.fmt==2 && e->g.I==e->u.I && e->g.O==e->u.O){
+                    matmul_i4_idot_pair(gg,uu,xg,e->g.q4,e->g.s,e->u.q4,e->u.s,nr,e->g.I,e->g.O);
+                } else if(g_idot && e->g.fmt==1 && e->u.fmt==1 && e->g.I==e->u.I && e->g.O==e->u.O){
+                    matmul_q_idot_pair(gg,uu,xg,e->g.q8,e->g.s,e->u.q8,e->u.s,nr,e->g.I,e->g.O);
+                } else {
+                    matmul_qt(gg,xg,&e->g,nr); matmul_qt(uu,xg,&e->u,nr);
+                }
+                for(int64_t z=0;z<(int64_t)nr*I;z++) gg[z]=siluf(gg[z])*uu[z];
+                matmul_qt(hh,gg,&e->d,nr);
+            }
             for(int r=0;r<nr;r++){ float *os=out+(int64_t)rows[r]*D, wgt=rw[r], *hr=hh+(int64_t)r*D;
                 for(int d=0;d<D;d++) os[d]+=wgt*hr[d]; }
             m->t_emm+=now_s()-t0;
@@ -1325,7 +2002,19 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
           int promo=nmiss<m->ecap?nmiss:m->ecap;
           for(int a=0;a<promo;a++){ int q=nmiss-1-a; ESlot *dst;
               if(*nn<m->ecap) dst=&Sl[(*nn)++];
-              else { int lru=0; for(int z=1;z<*nn;z++) if(Sl[z].used<Sl[lru].used) lru=z; dst=&Sl[lru]; }
+              else { int lru=0;
+                  /* LFRU: frequency is primary, recency breaks ties.
+                   * Evict the lowest-scoring resident; the incoming expert
+                   * must be hotter (25%+4 hysteresis) to displace it. */
+                  uint64_t worst=0;
+                  if(m->eheat && m->elast && m->eheat[layer] && m->elast[layer])
+                      worst=tier_lfru_score(m->eheat[layer][Sl[0].eid],m->elast[layer][Sl[0].eid],m->eaccess_clock);
+                  for(int z=1;z<*nn;z++){
+                      uint64_t s=0;
+                      if(m->eheat && m->elast && m->eheat[layer] && m->elast[layer])
+                          s=tier_lfru_score(m->eheat[layer][Sl[z].eid],m->elast[layer][Sl[z].eid],m->eaccess_clock);
+                      if(s<worst){ worst=s; lru=z; } }
+                  dst=&Sl[lru]; }
               ESlot tmp=*dst; *dst=m->ws[q]; m->ws[q]=tmp; dst->used=++m->eclock; }
         }
     }
@@ -1334,7 +2023,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
     for(int64_t z=0;z<(int64_t)S*sI;z++) sg[z]=siluf(sg[z])*su[z];
     matmul_qt(hh,sg,&l->sh_down,S);
     for(int64_t z=0;z<(int64_t)S*D;z++) out[z]+=hh[z];
-    free(logit); free(choice); free(idxs); free(ws); free(keff); free(uniq);
+    free(logit); free(choice); free(idxs); free(ws); free(keff); free(uniq); free(warm_tier);
     free(xg); free(gg); free(uu); free(hh); free(rows); free(rw); free(sg); free(su);
 }
 
@@ -1343,6 +2032,10 @@ static void layer_forward(Model *m, Layer *l, int li, float *x, int S, int pos_b
     for(int s=0;s<S;s++) rmsnorm(nrm+(int64_t)s*D,x+(int64_t)s*D,l->in_ln,D,c->eps);
     attention(m,l,li,nrm,S,pos_base,tmp);
     for(int64_t j=0;j<(int64_t)S*D;j++) x[j]+=tmp[j];
+    /* PILOT: after attention, predict next layer's experts and prefetch them
+     * while this layer's MoE computes. x is the post-attention state = next layer's input. */
+    if(g_pilot && S<=8 && li+1<c->n_layers && m->L[li+1].sparse)
+        pilot_prefetch(m,li+1,x,S);
     for(int s=0;s<S;s++) rmsnorm(nrm+(int64_t)s*D,x+(int64_t)s*D,l->post_ln,D,c->eps);
     if(l->sparse) moe(m,l,li,nrm,S,tmp);
     else dense_mlp(l,nrm,S,D,c->dense_inter,tmp);
@@ -1358,6 +2051,8 @@ static void layers_forward(Model *m, float *x, int S, int pos_base){
         layer_forward(m,&m->L[i],i,x,S,pos_base,nrm,tmp);
     }
     free(nrm); free(tmp);
+    /* Reset cross-layer barrier: next forward pass starts fresh */
+    if(g_pilot_real) atomic_store_explicit(&g_cur_moe_layer,-1,memory_order_release);
 }
 
 static void forward_all(Model *m, const int *ids, int S, int *pred){
@@ -1428,7 +2123,7 @@ static int mtp_one_forward(Model *m, int tok, int pos, float *logit){
     float *x=falloc(D), *cat=falloc(2*D), *hx=falloc(D), *nrm=falloc(D), *tmp=falloc(D);
     float *row=falloc(D), *h=falloc(D);
     memcpy(h,m->hlast,D*sizeof(float));
-    int prenorm=getenv("MTP_PRENORM")!=NULL;
+    int prenorm=getenv("MTP_PRENORM")?atoi(getenv("MTP_PRENORM")):1;
     embed_row(m,tok,x);
     rmsnorm(x,x,m->enorm,D,c->eps);
     if(!prenorm) rmsnorm(h,h,m->final_norm,D,c->eps);
@@ -1500,7 +2195,7 @@ static int mtp_draft(Model *m, int next_tok, int kv, int G, int *draft){
     float *row=falloc(D), *logit=falloc(c->vocab), *h=falloc(D);
     memcpy(h,m->hlast,D*sizeof(float));
     int tok=next_tok, n=0;
-    int prenorm=getenv("MTP_PRENORM")!=NULL;
+    int prenorm=getenv("MTP_PRENORM")?atoi(getenv("MTP_PRENORM")):1;
     for(int g=0;g<G;g++){
         int pos=p+g; if(pos+2>=m->max_t) break;
         embed_row(m,tok,x);
@@ -1532,7 +2227,7 @@ static void mtp_absorb(Model *m, const int *next_ids, const float *x, int S, int
     Cfg *c=&m->c; int D=c->hidden, li=c->n_layers;
     if(m->kv_start[li]<0||m->kv_start[li]>pos_base) m->kv_start[li]=pos_base;
     float *hx=falloc((int64_t)S*D), *cat=falloc(2*D), *e=falloc(D), *hn=falloc(D), *hf=falloc(D);
-    int prenorm=getenv("MTP_PRENORM")!=NULL;
+    int prenorm=getenv("MTP_PRENORM")?atoi(getenv("MTP_PRENORM")):1;
     for(int i=0;i<S;i++){
         embed_row(m,next_ids[i],e);
         rmsnorm(e,e,m->enorm,D,c->eps);
@@ -1583,6 +2278,8 @@ static int spec_decode(Model *m, int *all, int kv, int n_new, int eos, float *lo
     Cfg *c=&m->c; int V=c->vocab; int emitted=0, done=0;
     int draft[64]; int gd=g_draft; if(gd>63) gd=63;
     int carry_ban=-1;
+    enum { GUARD_PAUSE_TOKENS = 256 };
+    uint64_t gd_prop0=m->mtp_prop, gd_acc0=m->mtp_acc; int gd_pause=0;
     while(emitted<n_new&&!done){
         int next=pick_tok(logit,V,carry_ban); carry_ban=-1; free(logit); logit=NULL;
         if((eos>=0&&next==eos)||is_stop(&m->c,next)) break;
@@ -1591,10 +2288,12 @@ static int spec_decode(Model *m, int *all, int kv, int n_new, int eos, float *lo
         if(emitted>=n_new) break;
         int g=0, gsrc=0;
         if(gd>0){
-            if(m->has_mtp&&m->mtp_prop>=24&&m->mtp_acc*10<m->mtp_prop){
-                gd=0; g_draft=0;
-                fprintf(stderr,"[MTP] %.0f%% acceptance after %llu proposals: drafts disabled\n",
-                    100.0*m->mtp_acc/m->mtp_prop,(unsigned long long)m->mtp_prop);
+            if(gd_pause>0){ gd_pause--; if(!gd_pause){ gd_prop0=m->mtp_prop; gd_acc0=m->mtp_acc; } }
+            else if(m->has_mtp && m->mtp_prop-gd_prop0>=24 && (m->mtp_acc-gd_acc0)*10 < m->mtp_prop-gd_prop0){
+                fprintf(stderr,"[MTP] %.0f%% acceptance over the last %llu proposals: drafts paused for %d tokens\n",
+                    100.0*(m->mtp_acc-gd_acc0)/(m->mtp_prop-gd_prop0),
+                    (unsigned long long)(m->mtp_prop-gd_prop0), (int)GUARD_PAUSE_TOKENS);
+                gd_pause=GUARD_PAUSE_TOKENS;
             }
         }
         if(!g&&gd>0){
@@ -1720,7 +2419,7 @@ static int64_t expert_bytes_probe(Model *m, int ebits){
         const char *suf[3]={"gate_proj","up_proj","down_proj"};
         for(int k=0;k<3;k++){
             snprintf(nm,sizeof(nm),"model.layers.%d.mlp.experts.0.%s.weight",layer,suf[k]);
-            eb+=st_nbytes(&m->S,nm);
+            eb+=g_cfse?st_peek_decompressed_size(&m->S,nm):st_nbytes(&m->S,nm);
             snprintf(nm,sizeof(nm),"model.layers.%d.mlp.experts.0.%s.weight.qs",layer,suf[k]);
             int64_t q=st_nbytes(&m->S,nm); if(q>0) eb+=q;
         }
@@ -1783,7 +2482,14 @@ static void pin_load(Model *m, const char *statspath, double gb){
         if(a>4095) break;
     }
     int64_t eb=expert_bytes_probe(m,m->ebits);
-    int npin=(int)(gb*1e9/eb); if(npin>n) npin=n; if(npin>4096) npin=4096;
+    int npin;
+    if(getenv("PIN_COUNT")){
+        npin=atoi(getenv("PIN_COUNT"));
+        fprintf(stderr,"[PIN_COUNT=%d] forced (overrides RAM-based auto)\n",npin);
+    } else {
+        npin=(int)(gb*1e9/eb);
+    }
+    if(npin>n) npin=n; if(npin>4096) npin=4096;
     if(npin<1){ free(r); return; }
     int *cnt_l=calloc(c->n_layers+1,sizeof(int));
     for(int a=0;a<npin;a++) cnt_l[r[a].l]++;
@@ -1835,6 +2541,7 @@ static void pin_load(Model *m, const char *statspath, double gb){
                         m->gpu_expert_count++; m->gpu_expert_bytes+=actual;
                         remaining[best]-=actual; placed_b[best]+=actual; placed_n[best]++;
                         placed=1;
+                        if(g_cuda_release_host) expert_host_release(m,s);
                     } else {
                         qt_cuda_reset(&s->g); qt_cuda_reset(&s->u); qt_cuda_reset(&s->d);
                         s->g.cuda_eligible=s->u.cuda_eligible=s->d.cuda_eligible=0;
@@ -1896,6 +2603,7 @@ static void repin_pass(Model *m){
                                +(int64_t)coli_cuda_tensor_bytes(s->u.cuda)
                                +(int64_t)coli_cuda_tensor_bytes(s->d.cuda);
                 m->gpu_expert_bytes+=now_gpu-old_gpu; tier="VRAM";
+                if(g_cuda_release_host) expert_host_release(m,s);
             } else {
                 qt_cuda_reset(&s->g); qt_cuda_reset(&s->u); qt_cuda_reset(&s->d);
                 s->g.cuda_eligible=s->u.cuda_eligible=s->d.cuda_eligible=0;
@@ -1918,7 +2626,9 @@ static void cap_for_ram(Model *m, double ram_gb, int ebits, int max_ctx){
     if(auto_b){ ram_gb=g_mem_avail_boot*0.88; if(ram_gb<4) ram_gb=8; }
     double ws_b=64.0*(double)eb, kv_b=kv_pool_bytes(m,max_ctx);
     double attn_b=(double)max_ctx*c->n_heads*c->head_dim*4.0;
-    double pc_b=2.5e9, slack=1.2e9+pc_b+ws_b+kv_b+attn_b;
+    /* Without i8slab, experts use 3├ù less RAM ΓÇö reduce the working-set reserve
+     * and page-cache slack to allow a larger ecache cap. */
+    double pc_b=g_i8slab?2.5e9:0.5e9, slack=1.2e9+pc_b+ws_b+kv_b+attn_b;
     double avail=ram_gb*1e9-(double)m->resident_bytes-slack;
     int capmax=(avail>0&&nsp>0)?(int)(avail/((double)nsp*eb)):0;
     if(capmax<1) capmax=1;
@@ -1950,6 +2660,23 @@ static void profile_print(Model *m, double elapsed){
     double acc=m->t_edisk+m->t_emm+m->t_attn+m->t_head;
     printf("PROFILE: expert-disk %.3fs | expert-matmul %.3fs | attention %.3fs | lm_head %.3fs | other %.3fs\n",
         m->t_edisk,m->t_emm,m->t_attn,m->t_head,elapsed-acc);
+    if(g_cache_route && m->route_slots)
+        printf("  CACHE_ROUTE: swaps %.1f%% | route_agree %.1f%%\n",
+            100.0*m->route_swaps/m->route_slots,
+            m->route_agree_tot?100.0*m->route_agree_hit/m->route_agree_tot:0.0);
+    if(g_mirror){
+        int64_t bp=atomic_load(&g_mir_bytes[0]), bm=atomic_load(&g_mir_bytes[1]);
+        int64_t tot=bp+bm;
+        printf("  MIRROR: primary %.2f GB (%lld reads) | mirror %.2f GB (%lld reads) ΓÇö %.0f%% of expert bytes from the mirror\n",
+            bp/1e9,(long long)atomic_load(&g_mir_nread[0]),
+            bm/1e9,(long long)atomic_load(&g_mir_nread[1]),
+            tot?100.0*bm/tot:0.0);
+    }
+    if(g_pilot){
+        long loads=atomic_load(&g_pilot_loads), drops=atomic_load(&g_pilot_drops);
+        printf("  PILOT: %ld speculative loads / %ld drops (recall %.1f%%)\n",
+            loads,drops,loads+drops>0?100.0*loads/(loads+drops):0.0);
+    }
 }
 
 static void perf_report(Model *m){
@@ -2220,10 +2947,17 @@ int main(int argc, char **argv){
     const char *snap=getenv("SNAP"); if(!snap){fprintf(stderr,"SNAP=<dir>\n");return 1;}
     g_nopack=getenv("NOPACK")?1:0;
     g_drop=getenv("DROP")?1:0;
-    g_direct=getenv("DIRECT")?atoi(getenv("DIRECT")):0;
-    g_idot=getenv("IDOT")?atoi(getenv("IDOT")):0;  /* IDOT=1 breaks int4/int8 on Hy3 until validated */
+    g_direct=getenv("DIRECT")?atoi(getenv("DIRECT")):1;
+    g_idot=getenv("IDOT")?atoi(getenv("IDOT")):1;
     g_i4s=getenv("I4S")?atoi(getenv("I4S")):g_i4s;
-    g_pipe=getenv("PIPE")?atoi(getenv("PIPE")):0;
+    g_i8slab=getenv("I8SLAB")?atoi(getenv("I8SLAB")):0;  /* I8SLAB=1: pre-dequant to int8 (3├ù RAM, faster matmul) */
+    g_pipe=getenv("PIPE")?atoi(getenv("PIPE")):
+#ifdef _WIN32
+        1
+#else
+        0
+#endif
+        ;
     if(g_pipe==2){
 #if !defined(__linux__) || !defined(COLI_IOURING)
         fprintf(stderr,"[PIPE] io_uring requires Linux build with IOURING=1, using thread pool\n");
@@ -2232,7 +2966,24 @@ int main(int argc, char **argv){
     }
     g_pipe_nw=getenv("PIPE_WORKERS")?atoi(getenv("PIPE_WORKERS")):8;
     if(g_pipe_nw<1) g_pipe_nw=1;
+    g_pipe_block=getenv("COLI_PIPE_BLOCK")?atoi(getenv("COLI_PIPE_BLOCK")):1;
     g_perf=getenv("PERF")?atoi(getenv("PERF")):0;
+    g_prefetch=getenv("PREFETCH")?atoi(getenv("PREFETCH")):0;
+    g_pilot=getenv("PILOT")?atoi(getenv("PILOT")):0;       /* default OFF: PIPE+DIRECT already overlap I/O */
+    g_pilot_real=getenv("PILOT_REAL")?atoi(getenv("PILOT_REAL")):1; /* real loads into ecache */
+    if(!g_pilot) g_pilot_real=0;  /* PILOT=0 disables everything */
+    if(g_pilot_real) g_pilot=1;   /* PILOT_REAL implies PILOT */
+    g_pilot_k=getenv("PILOT_K")?atoi(getenv("PILOT_K")):(g_pilot_real?6:8);
+    if(g_pilot_k<1) g_pilot_k=1;
+    g_pilot_evict_guard=getenv("PILOT_EVICT_GUARD")?atoi(getenv("PILOT_EVICT_GUARD")):1;
+    if(g_pilot) fprintf(stderr,"[PILOT] on K=%d real=%d (router-lookahead prefetch)\n",g_pilot_k,g_pilot_real);
+    g_cache_route=getenv("CACHE_ROUTE")?atoi(getenv("CACHE_ROUTE")):0;
+    g_route_j=getenv("ROUTE_J")?atoi(getenv("ROUTE_J")):2;
+    g_route_m=getenv("ROUTE_M")?atoi(getenv("ROUTE_M")):12;
+    if(g_cache_route) fprintf(stderr,"[CACHE_ROUTE] on J=%d M=%d (pinΓê¬LRU prefer)\n",g_route_j,g_route_m);
+    g_mirror_dir = getenv("COLI_MODEL_MIRROR");
+    if(!g_mirror_dir||!*g_mirror_dir) g_mirror_dir = getenv("SNAP_MIRROR");
+    if(g_mirror_dir&&!*g_mirror_dir) g_mirror_dir = NULL;
     g_kv_i8=getenv("KV_I8")?atoi(getenv("KV_I8")):0;
     g_tree_draft=getenv("TREE_DRAFT")?atoi(getenv("TREE_DRAFT")):0;
     if(g_tree_draft) fprintf(stderr,"[TREE_DRAFT] tree speculative decoding enabled\n");
@@ -2240,7 +2991,15 @@ int main(int argc, char **argv){
     g_nuc=getenv("NUCLEUS")?atof(getenv("NUCLEUS")):0.90f;
     g_topk=getenv("TOPK")?atoi(getenv("TOPK")):0;
     g_topp=getenv("TOPP")?atof(getenv("TOPP")):0;
-    g_repin=getenv("REPIN")?atoi(getenv("REPIN")):0;
+    g_vram_bias=getenv("VRAM_BIAS")?atof(getenv("VRAM_BIAS")):0;
+    if(g_vram_bias>0) fprintf(stderr,"[VRAM_BIAS=%.2f] boosting warm expert scores\n",g_vram_bias);
+    g_ram_bias_ratio=getenv("RAM_BIAS_RATIO")?atof(getenv("RAM_BIAS_RATIO")):0.5f;
+    if(g_vram_bias>0&&g_ram_bias_ratio>0) fprintf(stderr,"[RAM_BIAS_RATIO=%.2f] RAM-only pin bias = VRAM_BIAS * %.2f\n",g_ram_bias_ratio,g_ram_bias_ratio);
+    g_warm_window=getenv("WARM_WINDOW")?atoi(getenv("WARM_WINDOW")):0;
+    if(g_warm_window>0) fprintf(stderr,"[WARM_WINDOW=%d] recency-based warm detection enabled\n",g_warm_window);
+    g_cuda_release_host=getenv("CUDA_RELEASE_HOST")?atoi(getenv("CUDA_RELEASE_HOST")):0;
+    g_repin=getenv("REPIN")?atoi(getenv("REPIN")):16;
+    g_cfse=getenv("CFSE")?atoi(getenv("CFSE")):0;
     g_draft=getenv("DRAFT")?atoi(getenv("DRAFT")):-1;
     if(g_draft>63) g_draft=63;
     int cap=argc>1?atoi(argv[1]):64;
@@ -2264,6 +3023,7 @@ int main(int argc, char **argv){
     if(g_cuda_dense&&!g_cuda_enabled){ fprintf(stderr,"CUDA_DENSE requires COLI_CUDA=1\n"); return 2; }
     if(g_cuda_expert_gb>0 && !g_cuda_enabled){ fprintf(stderr,"CUDA_EXPERT_GB requires COLI_CUDA=1\n"); return 2; }
     if(g_cuda_enabled) fprintf(stderr,COLI_ACCEL_TAG " mode: routed experts%s\n",g_cuda_dense?" + resident dense tensors":" only (resident dense on CPU)");
+    if(g_cuda_enabled&&g_cuda_release_host) fprintf(stderr,COLI_ACCEL_TAG " VRAM experts without host backing\n");
 #else
     if((getenv("COLI_CUDA") && atoi(getenv("COLI_CUDA"))) ||
        getenv("COLI_GPU") || getenv("COLI_GPUS") ||
@@ -2276,7 +3036,8 @@ int main(int argc, char **argv){
     printf("== Hy3 C engine, cache=%d experts/layer | experts@%d-bit dense@%d-bit ==\n",cap,ebits,dbits);
     g_mem_avail_boot=mem_available_gb();
     Model m; double t0=now_s(); model_init(&m,snap,cap,ebits,dbits);
-    if(g_draft<0) g_draft=m.has_mtp?3:0;
+    mirror_setup(&m);  /* DUAL-SSD: register mirror before pin/autopin load */
+    if(g_draft<0) g_draft=m.has_mtp?1:0;
     fprintf(stderr,"[MTP] %s (draft=%d)\n",
         m.has_mtp?"active: native speculative decoding":"absent",g_draft);
     printf("loaded in %.2fs | resident dense: %.2f MB | layers=%d experts=%d%s\n",
@@ -2299,19 +3060,22 @@ int main(int argc, char **argv){
       int autopin=getenv("AUTOPIN")?atoi(getenv("AUTOPIN")):1;
       if(!getenv("PIN")&&autopin&&hist>=5000){
           double conf=(double)hist/200000.0; if(conf>1) conf=1;
-          double pin_gb=expert_avail(&m,ram_env,ebits,est_ctx)*0.5*conf/1e9;
+          double ratio=g_cuda_release_host?0.9:0.5;
+          double pin_gb=expert_avail(&m,ram_env,ebits,est_ctx)*ratio*conf/1e9;
           if(pin_gb>=0.5) pin_load(&m,g_usage_path,pin_gb);
       }
       cap_for_ram(&m,ram_env,ebits,est_ctx); }
 
-    const char *stats=getenv("STATS");
-    if(getenv("SCORE")){ run_score(&m,getenv("SCORE")); if(stats) stats_dump(&m,stats); usage_save(&m); return 0; }
+    if(g_pilot) pilot_ensure_started(&m);
 
-    if(getenv("SERVE")){ run_serve(&m,snap); if(stats) stats_dump(&m,stats); usage_save(&m); return 0; }
+    const char *stats=getenv("STATS");
+    if(getenv("SCORE")){ run_score(&m,getenv("SCORE")); if(stats) stats_dump(&m,stats); usage_save(&m); prefetch_stop(); return 0; }
+
+    if(getenv("SERVE")){ run_serve(&m,snap); if(stats) stats_dump(&m,stats); usage_save(&m); prefetch_stop(); return 0; }
     if(getenv("PROMPT")){
         if(getenv("IDS")) run_prompt_ids(&m,getenv("NGEN")?atoi(getenv("NGEN")):32);
         else run_text(&m,snap,getenv("PROMPT"),getenv("NGEN")?atoi(getenv("NGEN")):32);
-        if(stats) stats_dump(&m,stats); usage_save(&m); return 0;
+        if(stats) stats_dump(&m,stats); usage_save(&m); prefetch_stop(); return 0;
     }
 
     const char *refpath=getenv("REF")?getenv("REF"):"ref_hy3.json";
@@ -2343,13 +3107,13 @@ int main(int argc, char **argv){
             m.gpu_expert_count,m.gpu_expert_bytes/1e9,(unsigned long long)m.gpu_expert_calls);
         if(g_cuda_enabled) cuda_stats_print();
 #endif
-        free(full); free(tf); free(pred); free(b); free(ar); return ok==nfull?0:1;
+        free(full); free(tf); free(pred); free(b); free(ar); prefetch_stop(); return ok==nfull?0:1;
     }
 
     int np,nfull; int *prompt=read_arr(ref,"prompt_ids",&np); int *full=read_arr(ref,"full_ids",&nfull);
     int n_new=nfull-np;
 
-    if(getenv("REPLAY")){ run_replay(&m,full,nfull,np); free(b); free(ar); free(prompt); free(full); return 0; }
+    if(getenv("REPLAY")){ run_replay(&m,full,nfull,np); free(b); free(ar); free(prompt); free(full); prefetch_stop(); return 0; }
     int *out=malloc((np+n_new)*sizeof(int));
     double t=now_s(); generate(&m,prompt,np,n_new,out); double dt=now_s()-t;
     int match=0;
@@ -2367,6 +3131,7 @@ int main(int argc, char **argv){
 #endif
     if(stats) stats_dump(&m,stats);
     usage_save(&m);
+    prefetch_stop();
     free(b); free(ar); free(prompt); free(full); free(out);
     return 0;
 }

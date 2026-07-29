@@ -94,6 +94,7 @@ typedef int (*fn_pipe_sync)(int device);
 typedef int (*fn_pipe_upload)(int device,void *dst,const void *src,size_t bytes);
 typedef int (*fn_shared_mlp_w4a16)(ColiCudaTensor *gate, ColiCudaTensor *up, ColiCudaTensor *down, float *y, const float *x, int S);
 typedef int (*fn_tensor_update)(ColiCudaTensor *tensor, const void *weights, const float *scales);
+typedef int (*fn_gqa_attention)(float *ctx, const float *q, const float *k_cache, const float *v_cache, int S, int H, int Hkv, int hd, int st0, int pos_base, int max_t, int device);
 
 /* Resolved pointers, plus a flag so we attempt the load at most once. */
 static struct {
@@ -147,6 +148,7 @@ static struct {
     fn_pipe_upload pipe_upload;
     fn_shared_mlp_w4a16 shared_mlp_w4a16;
     fn_tensor_update tensor_update;
+    fn_gqa_attention gqa_attention;
 } g_cuda;
 
 /* Resolve the DLL and all 11 symbols. Returns 1 on success, 0 otherwise.
@@ -247,6 +249,7 @@ static int coli_cuda_load(void){
     RESOLVE(pipe_upload, fn_pipe_upload)
     RESOLVE(shared_mlp_w4a16, fn_shared_mlp_w4a16)
     RESOLVE(tensor_update, fn_tensor_update)
+    RESOLVE(gqa_attention, fn_gqa_attention)
     #undef RESOLVE
 
     g_cuda.available = 1;
@@ -509,6 +512,14 @@ int coli_cuda_shared_mlp_w4a16(ColiCudaTensor *gate, ColiCudaTensor *up, ColiCud
 int coli_cuda_tensor_update(ColiCudaTensor *tensor, const void *weights, const float *scales){
     if(!g_cuda.available){ return 0; }
     return g_cuda.tensor_update(tensor, weights, scales);
+}
+
+int coli_cuda_gqa_attention(float *ctx, const float *q,
+                            const float *k_cache, const float *v_cache,
+                            int S, int H, int Hkv, int hd, int st0, int pos_base,
+                            int max_t, int device){
+    if(!g_cuda.available){ return 0; }
+    return g_cuda.gqa_attention(ctx, q, k_cache, v_cache, S, H, Hkv, hd, st0, pos_base, max_t, device);
 }
 
 #endif /* _WIN32 */

@@ -72,19 +72,17 @@ else ifneq ($(IS_WIN),)
 # --- Windows 11 x86-64 (MinGW-w64 / MSYS2) ---
 # GCC + libgomp + winpthreads: pthread, OpenMP, clock_gettime, opendir/readdir,
 # AVX2 intrinsics - tutto gratis, nessun porting.
-# ARCH default = x86-64-v3 (portable binary with AVX2). For max speed on THIS
-# machine use ARCH=native: on AVX-VNNI CPUs (Intel Alder Lake+, Meteor Lake+)
-# it also unlocks the 128-bit VPDPBUSD int8/int4 dot kernel (dot_i8i8/dot_i4i8),
-# which the x86-64-v3 baseline does not define. The #ifdef guards in colibri.c mean
-# a v3 build simply compiles out the VNNI path - safe on any x86-64.
+# ARCH default = native (max speed on THIS machine). On AVX-VNNI CPUs
+# (Intel Alder Lake+, Meteor Lake+) this unlocks the 128-bit VPDPBUSD int8
+# dot kernel (dot_i8i8). Set ARCH=x86-64-v3 for a portable binary.
 CC      = gcc
-ARCH   ?= x86-64-v3
-CFLAGS  = -D_FILE_OFFSET_BITS=64 -O3 -march=$(ARCH) -fopenmp -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function
+ARCH   ?= native
+CFLAGS  = -D_FILE_OFFSET_BITS=64 -DUSE_ZSTD -O3 -march=$(ARCH) -fopenmp -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function
 # -lpsapi: compat.h calls GetProcessMemoryInfo (rss_gb). It's linked via
 # #pragma comment(lib,"psapi.lib") for MSVC, but MinGW gcc ignores that pragma
 # (warns), so link psapi explicitly or the build fails undefined-reference on
 # modern GCC (e.g. 16.x under UCRT). Harmless where the pragma also resolves it.
-LDFLAGS = -lm -fopenmp -static -lpsapi
+LDFLAGS = -lm -fopenmp -static -lpsapi -lzstd
 EXE     = .exe
 else
 ifneq (,$(PPC64))

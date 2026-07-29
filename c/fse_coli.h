@@ -100,7 +100,7 @@ raw:
 
 /* 0 = ok (rawlen scritto), -1 = input invalido/corrotto/troncato. MAI legge
  * oltre in+nin ne' scrive oltre out+cap. */
-static int cfse_decompress(const uint8_t *in, size_t nin, uint8_t *out, size_t cap, size_t *rawlen){
+static __attribute__((noinline)) int cfse_decompress(const uint8_t *in, size_t nin, uint8_t *out, size_t cap, size_t *rawlen){
     if(nin<CFSE_HDR || memcmp(in,"CFS1",4)) return -1;
     size_t n = (size_t)in[5] | ((size_t)in[6]<<8) | ((size_t)in[7]<<16) | ((size_t)in[8]<<24);
     if(n>cap) return -1;
