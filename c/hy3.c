@@ -388,6 +388,9 @@ static void matmul_i2(float *y, const float *x, const uint8_t *q2, const float *
 static int g_idot=1, g_i4s=1, g_nopack=0, g_drop=0, g_direct=1, g_i8slab=0;
 static int g_perf=0, g_kv_i8=0, g_tree_draft=0;
 static int g_prefetch=0;  /* PREFETCH=1: cross-layer expert preload via background thread (experimental) */
+#ifdef _WIN32
+static DWORD_PTR g_e_mask=0;  /* E-core affinity mask for background threads */
+#endif
 static int g_cache_route=1;  /* CACHE_ROUTE=1: cache-aware routing (max-rank, arXiv 2412.00099) */
 static int g_route_j=2;      /* ROUTE_J: sacred top ranks (always take, even uncached) */
 static int g_route_m=12;     /* ROUTE_M: max-rank window for cache-preferring fill */
@@ -1333,7 +1336,7 @@ static void expert_prefetch(Model *m, int layer, int eid){
  * PILOT_REAL: actually load the expert (pread) into the future layer's ecache.
  * g_cur_moe_layer: barrier ΓÇö pilot won't touch layers the main thread has entered. */
 
-static int g_pilot=0;       /* PILOT=1: router-lookahead prefetch */
+static int g_pilot=1;       /* PILOT=1: router-lookahead prefetch (runs on E-cores on Windows) */
 static int g_pilot_real=1;  /* PILOT_REAL=1: real loads into ecache (default ON) */
 static int g_pilot_k=6;     /* PILOT_K: top-K predictions to prefetch */
 static int g_pilot_evict_guard=1; /* protect warm experts from speculative eviction */
@@ -1397,6 +1400,9 @@ static void pilot_realload(Model *m, int layer, int eid){
 
 static void *pilot_worker(void *arg){
     (void)arg;
+#ifdef _WIN32
+    if(g_e_mask) SetThreadAffinityMask(GetCurrentThread(), g_e_mask);
+#endif
     for(;;){
         unsigned r=__atomic_load_n(&pilot_r,__ATOMIC_ACQUIRE);
         unsigned w=__atomic_load_n(&pilot_w,__ATOMIC_ACQUIRE);
@@ -2967,6 +2973,7 @@ int main(int argc, char **argv){
               SetEnvironmentVariable("OMP_NUM_THREADS", omp_env);
               SetEnvironmentVariable("OMP_PROC_BIND", "close");
               omp_set_num_threads(p_logical);
+              g_e_mask = sys_aff & ~mask; /* remaining logical procs = E-cores */
           }
       }
     }
@@ -2996,7 +3003,7 @@ int main(int argc, char **argv){
     g_pipe_block=getenv("COLI_PIPE_BLOCK")?atoi(getenv("COLI_PIPE_BLOCK")):1;
     g_perf=getenv("PERF")?atoi(getenv("PERF")):0;
     g_prefetch=getenv("PREFETCH")?atoi(getenv("PREFETCH")):0;
-    g_pilot=getenv("PILOT")?atoi(getenv("PILOT")):0;       /* default OFF: PIPE+DIRECT already overlap I/O */
+    g_pilot=getenv("PILOT")?atoi(getenv("PILOT")):1;       /* runs on E-cores on Windows */
     g_pilot_real=getenv("PILOT_REAL")?atoi(getenv("PILOT_REAL")):1; /* real loads into ecache */
     if(!g_pilot) g_pilot_real=0;  /* PILOT=0 disables everything */
     if(g_pilot_real) g_pilot=1;   /* PILOT_REAL implies PILOT */
