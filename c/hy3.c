@@ -130,6 +130,7 @@ static int64_t qt_bytes(const QT *t){
     if(t->fmt==0) return n*4;
     if(t->fmt==1) return n+(int64_t)t->O*4;
     if(t->fmt==3) return (int64_t)t->O*((t->I+3)/4)+(int64_t)t->O*4;
+    if(t->fmt==4) return (int64_t)t->O*((t->I+3)/4)+(int64_t)t->O*4;
     return (int64_t)t->O*((t->I+1)/2)+(int64_t)t->O*4;
 }
 
@@ -148,6 +149,7 @@ typedef struct {
     int64_t slab_cap, fslab_cap; uint64_t used;
     uint8_t *cfse_tmp; int64_t cfse_tmp_cap;
     int8_t *i8slab; int64_t i8slab_cap;
+    uint8_t *i2slab; int64_t i2slab_cap;
 } ESlot;
 
 typedef struct {
@@ -389,7 +391,7 @@ static void matmul_i2(float *y, const float *x, const uint8_t *q2, const float *
             y[(int64_t)s*O+o]=a*sc; } }
 }
 
-static int g_idot=1, g_i4s=1, g_nopack=0, g_drop=0, g_direct=1, g_i8slab=0;
+static int g_idot=1, g_i4s=1, g_nopack=0, g_drop=0, g_direct=1, g_i8slab=0, g_int2_ecache=0;  /* INT2_ECACHE=1: ecache shrunk to 2-bit (experimental, quality loss) */
 static int g_perf=0, g_kv_i8=0, g_tree_draft=0;
 static int g_prefetch=0;  /* PREFETCH=1: cross-layer expert preload via background thread (experimental) */
 #ifdef _WIN32
@@ -563,6 +565,81 @@ static inline int32_t dot_i4i8(const uint8_t *w4, const int8_t *x, int I){
 #endif
     return sum;
 }
+static inline int32_t dot_i2i8(const uint8_t *w2, const int8_t *x, int I){
+    int32_t sum=0; int i=0;
+#if defined(__AVXVNNI__) && defined(__AVX2__)
+    const __m128i b1=_mm_set1_epi8(1);
+    const __m128i shuf=_mm_setr_epi8(0,8,1,9,2,10,3,11,4,12,5,13,6,14,7,15);
+    const __m128i m16_3=_mm_set1_epi16(3);
+    __m128i a0=_mm_setzero_si128(),a1=_mm_setzero_si128(),a2=_mm_setzero_si128(),a3=_mm_setzero_si128();
+    for(;i+64<=I;i+=64){
+        const uint32_t *wp=(const uint32_t*)(w2+i/4);
+        __m128i wv[4]; __m128i z=_mm_setzero_si128();
+        for(int g=0;g<4;g++){
+            __m128i b=_mm_cvtsi32_si128(wp[g]);
+            __m128i w16=_mm_unpacklo_epi8(b,z);
+            __m128i s0_=_mm_and_si128(w16,m16_3);
+            __m128i s2_=_mm_and_si128(_mm_srli_epi16(w16,2),m16_3);
+            __m128i s4_=_mm_and_si128(_mm_srli_epi16(w16,4),m16_3);
+            __m128i s6_=_mm_and_si128(_mm_srli_epi16(w16,6),m16_3);
+            wv[g]=_mm_shuffle_epi8(_mm_unpacklo_epi8(
+                _mm_packus_epi16(s0_,s2_),_mm_packus_epi16(s4_,s6_)),shuf);
+        }
+        wv[0]=_mm_sub_epi8(wv[0],b1); wv[1]=_mm_sub_epi8(wv[1],b1);
+        wv[2]=_mm_sub_epi8(wv[2],b1); wv[3]=_mm_sub_epi8(wv[3],b1);
+        __m128i x0=_mm_loadu_si128((const __m128i*)(x+i)), x1=_mm_loadu_si128((const __m128i*)(x+i+16));
+        __m128i x2=_mm_loadu_si128((const __m128i*)(x+i+32)), x3=_mm_loadu_si128((const __m128i*)(x+i+48));
+        a0=_mm_dpbusd_epi32(a0,_mm_abs_epi8(wv[0]),_mm_sign_epi8(x0,wv[0]));
+        a1=_mm_dpbusd_epi32(a1,_mm_abs_epi8(wv[1]),_mm_sign_epi8(x1,wv[1]));
+        a2=_mm_dpbusd_epi32(a2,_mm_abs_epi8(wv[2]),_mm_sign_epi8(x2,wv[2]));
+        a3=_mm_dpbusd_epi32(a3,_mm_abs_epi8(wv[3]),_mm_sign_epi8(x3,wv[3]));
+    }
+    __m128i acc=_mm_add_epi32(_mm_add_epi32(a0,a1),_mm_add_epi32(a2,a3));
+    for(;i+32<=I;i+=32){
+        __m128i b=_mm_cvtsi32_si128(*(const uint32_t*)(w2+i/4));
+        __m128i w16=_mm_unpacklo_epi8(b,_mm_setzero_si128());
+        __m128i s0_=_mm_and_si128(w16,m16_3), s2_=_mm_and_si128(_mm_srli_epi16(w16,2),m16_3);
+        __m128i s4_=_mm_and_si128(_mm_srli_epi16(w16,4),m16_3), s6_=_mm_and_si128(_mm_srli_epi16(w16,6),m16_3);
+        __m128i wr=_mm_shuffle_epi8(_mm_unpacklo_epi8(
+            _mm_packus_epi16(s0_,s2_),_mm_packus_epi16(s4_,s6_)),shuf);
+        wr=_mm_sub_epi8(wr,b1);
+        __m128i xa=_mm_loadu_si128((const __m128i*)(x+i)), xb=_mm_loadu_si128((const __m128i*)(x+i+16));
+        acc=_mm_dpbusd_epi32(acc,_mm_abs_epi8(wr),_mm_sign_epi8(xa,wr));
+        // second 16 values from the same 4 bytes using unpackhi
+        __m128i wr2=_mm_shuffle_epi8(_mm_unpackhi_epi8(
+            _mm_packus_epi16(s0_,s2_),_mm_packus_epi16(s4_,s6_)),shuf);
+        wr2=_mm_sub_epi8(wr2,b1);
+        acc=_mm_dpbusd_epi32(acc,_mm_abs_epi8(wr2),_mm_sign_epi8(xb,wr2));
+    }
+    sum=hsum128_i32(acc);
+    for(;i<I;i++) sum+=(((int)((w2[i>>2]>>((i&3)*2))&3)-1)*x[i]);
+#elif defined(__AVX2__)
+    const __m256i b1=_mm256_set1_epi8(1); const __m256i ones=_mm256_set1_epi16(1);
+    const __m128i m16_3=_mm_set1_epi16(3); const __m128i shuf=_mm_setr_epi8(0,8,1,9,2,10,3,11,4,12,5,13,6,14,7,15);
+    __m256i acc=_mm256_setzero_si256();
+    for(;i+32<=I;i+=32){
+        __m128i b=_mm_cvtsi32_si128(*(const uint32_t*)(w2+i/4));
+        __m128i w16=_mm_unpacklo_epi8(b,_mm_setzero_si128());
+        __m128i s0_=_mm_and_si128(w16,m16_3), s2_=_mm_and_si128(_mm_srli_epi16(w16,2),m16_3);
+        __m128i s4_=_mm_and_si128(_mm_srli_epi16(w16,4),m16_3), s6_=_mm_and_si128(_mm_srli_epi16(w16,6),m16_3);
+        __m128i wlo=_mm_shuffle_epi8(_mm_unpacklo_epi8(
+            _mm_packus_epi16(s0_,s2_),_mm_packus_epi16(s4_,s6_)),shuf);
+        __m128i whi=_mm_shuffle_epi8(_mm_unpackhi_epi8(
+            _mm_packus_epi16(s0_,s2_),_mm_packus_epi16(s4_,s6_)),shuf);
+        __m256i wv=_mm256_sub_epi8(_mm256_set_m128i(whi,wlo),b1);
+        __m256i xv=_mm256_loadu_si256((const __m256i*)(x+i));
+        __m256i p=_mm256_maddubs_epi16(_mm256_sign_epi8(wv,wv),_mm256_sign_epi8(xv,wv));
+        acc=_mm256_add_epi32(acc,_mm256_madd_epi16(p,ones));
+    }
+    sum=hsum256_i32(acc);
+    for(;i<I;i++) sum+=(((int)((w2[i>>2]>>((i&3)*2))&3)-1)*x[i]);
+#else
+    for(;i+3<I;i+=4){ uint8_t b=w2[i>>2];
+        sum+=(((int)(b&3)-1)*x[i])+(((int)((b>>2)&3)-1)*x[i+1])+(((int)((b>>4)&3)-1)*x[i+2])+(((int)(b>>6)-1)*x[i+3]); }
+    for(;i<I;i++) sum+=(((int)((w2[i>>2]>>((i&3)*2))&3)-1)*x[i]);
+#endif
+    return sum;
+}
 static void matmul_q_idot(float *y, const int8_t *xq, const float *sx, const int8_t *q,
                           const float *scale, int S, int I, int O){
     #pragma omp parallel for schedule(static)
@@ -575,6 +652,13 @@ static void matmul_i4_idot(float *y, const int8_t *xq, const float *sx, const ui
     #pragma omp parallel for schedule(static)
     for(int o=0;o<O;o++){ const uint8_t *w=q4+(int64_t)o*rb; float sc=scale[o];
         for(int s=0;s<S;s++) y[(int64_t)s*O+o]=(float)dot_i4i8(w,xq+(int64_t)s*I,I)*sc*sx[s]; }
+}
+static void matmul_i2_idot(float *y, const int8_t *xq, const float *sx, const uint8_t *q2,
+                           const float *scale, int S, int I, int O){
+    int rb=(I+3)/4;
+    #pragma omp parallel for schedule(static)
+    for(int o=0;o<O;o++){ const uint8_t *w=q2+(int64_t)o*rb; float sc=scale[o]*4;
+        for(int s=0;s<S;s++) y[(int64_t)s*O+o]=(float)dot_i2i8(w,xq+(int64_t)s*I,I)*sc*sx[s]; }
 }
 
 typedef struct { int8_t *xq; size_t xq_cap; float *sx; size_t sx_cap; } QScratch;
@@ -606,6 +690,27 @@ static void matmul_i4_idot_pair(float *yg, float *yu, const float *x,
             const int8_t *xs=xq+(int64_t)s*I;
             yg[(int64_t)s*O+o]=(float)dot_i4i8(wg,xs,I)*scg*sx[s];
             yu[(int64_t)s*O+o]=(float)dot_i4i8(wu,xs,I)*scu*sx[s];
+        }
+    }
+}
+
+/* Same fusion for int2 weights (fmt==4, shrunk ecache) */
+static void matmul_i2_idot_pair(float *yg, float *yu, const float *x,
+                               const uint8_t *qg, const float *sg,
+                               const uint8_t *qu, const float *su,
+                               int S, int I, int O){
+    int rb=(I+3)/4;
+    int8_t *xq; float *sx;
+    quant_scratch((size_t)S*I,(size_t)S,&xq,&sx);
+    for(int s=0;s<S;s++) sx[s]=qrow_i8(x+(int64_t)s*I,xq+(int64_t)s*I,I);
+    #pragma omp parallel for schedule(static)
+    for(int o=0;o<O;o++){
+        const uint8_t *wg=qg+(int64_t)o*rb, *wu=qu+(int64_t)o*rb;
+        float scg=sg[o]*4, scu=su[o]*4;
+        for(int s=0;s<S;s++){
+            const int8_t *xs=xq+(int64_t)s*I;
+            yg[(int64_t)s*O+o]=(float)dot_i2i8(wg,xs,I)*scg*sx[s];
+            yu[(int64_t)s*O+o]=(float)dot_i2i8(wu,xs,I)*scu*sx[s];
         }
     }
 }
@@ -642,16 +747,18 @@ static void matmul_qt(float *y, const float *x, QT *w, int S){
     }
 #endif
     if(w->fmt==0){ matmul(y,x,w->qf,S,w->I,w->O); return; }
-    if(g_idot&&(w->fmt==1||(w->fmt==2&&S>=g_i4s))){
+    if(g_idot&&(w->fmt==1||(w->fmt==2&&S>=g_i4s)||w->fmt==4)){
         int I=w->I; int8_t *xq; float *sx;
         quant_scratch((size_t)S*I,(size_t)S,&xq,&sx);
         for(int s=0;s<S;s++) sx[s]=qrow_i8(x+(int64_t)s*I,xq+(int64_t)s*I,I);
         if(w->fmt==1) matmul_q_idot(y,xq,sx,w->q8,w->s,S,I,w->O);
+        else if(w->fmt==4) matmul_i2_idot(y,xq,sx,w->q4,w->s,S,I,w->O);
         else matmul_i4_idot(y,xq,sx,w->q4,w->s,S,I,w->O);
         return;
     }
     if(w->fmt==1) matmul_q(y,x,w->q8,w->s,S,w->I,w->O);
     else if(w->fmt==3) matmul_i2(y,x,w->q4,w->s,S,w->I,w->O);
+    else if(w->fmt==4) matmul_i2(y,x,w->q4,w->s,S,w->I,w->O);  /* fallback scalar path */
     else matmul_i4(y,x,w->q4,w->s,S,w->I,w->O);
 }
 
@@ -1816,11 +1923,42 @@ static void dense_mlp(Layer *l, float *x, int S, int D, int I, float *out){
 static void expert_host_release(Model *m, ESlot *s){
     if(!s->slab&&!s->fslab) return;
     int64_t bytes=qt_bytes(&s->g)+qt_bytes(&s->u)+qt_bytes(&s->d);
-    compat_aligned_free(s->slab); free(s->fslab); free(s->cfse_tmp); free(s->i8slab);
-    s->slab=NULL; s->fslab=NULL; s->slab_cap=s->fslab_cap=0; s->cfse_tmp=NULL; s->cfse_tmp_cap=0; s->i8slab=NULL; s->i8slab_cap=0;
+    compat_aligned_free(s->slab); free(s->fslab); free(s->cfse_tmp); free(s->i8slab); free(s->i2slab);
+    s->slab=NULL; s->fslab=NULL; s->slab_cap=s->fslab_cap=0; s->cfse_tmp=NULL; s->cfse_tmp_cap=0;
+    s->i8slab=NULL; s->i8slab_cap=0; s->i2slab=NULL; s->i2slab_cap=0;
     QT *q[3]={&s->g,&s->u,&s->d};
     for(int k=0;k<3;k++){ q[k]->qf=NULL; q[k]->q8=NULL; q[k]->q4=NULL; q[k]->s=NULL; }
     m->resident_bytes-=bytes; if(m->resident_bytes<0) m->resident_bytes=0;
+}
+
+static void expert_shrink_to_int2(Model *m, ESlot *s){
+    if(!s->slab) return;
+    QT *qt[3]={&s->g,&s->u,&s->d};
+    for(int k=0;k<3;k++) if(qt[k]->fmt!=2) return;
+    int64_t i2tot=0;
+    for(int k=0;k<3;k++) i2tot+=(int64_t)qt[k]->O*((qt[k]->I+3)/4);
+    if(!s->i2slab||i2tot>s->i2slab_cap){ free(s->i2slab);
+        s->i2slab=(uint8_t*)malloc(i2tot); if(!s->i2slab){fprintf(stderr,"OOM i2slab\n");exit(1);} s->i2slab_cap=i2tot; }
+    int64_t off=0, old_bytes=0;
+    for(int k=0;k<3;k++){
+        int O=qt[k]->O, I=qt[k]->I;
+        int old_rb=(I+1)/2, new_rb=(I+3)/4;
+        int64_t tsz=(int64_t)O*new_rb;
+        old_bytes+=qt_bytes(qt[k]);
+        uint8_t *src=qt[k]->q4, *dst=s->i2slab+off;
+        for(int o=0;o<O;o++){
+            for(int i=0;i<I;i+=4){
+                uint8_t b0=src[o*old_rb+i/2], b1=src[o*old_rb+i/2+1];
+                dst[o*new_rb+i/4]=((b1>>6)<<6)|(((b1>>2)&3)<<4)|(((b0>>6)&3)<<2)|((b0>>2)&3);
+            }
+        }
+        qt[k]->fmt=4; qt[k]->q4=dst;
+        off+=tsz;
+    }
+    compat_aligned_free(s->slab); s->slab=NULL; s->slab_cap=0;
+    free(s->i8slab); s->i8slab=NULL; s->i8slab_cap=0;
+    free(s->cfse_tmp); s->cfse_tmp=NULL; s->cfse_tmp_cap=0;
+    m->resident_bytes-=old_bytes; m->resident_bytes+=qt_bytes(&s->g)+qt_bytes(&s->u)+qt_bytes(&s->d);
 }
 
 /* DUAL-SSD: measure one replica's read bandwidth with the engine's own access
@@ -2049,7 +2187,9 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
 #endif
             {
                 /* Fused gate+up: quantize x once, compute both with same xq */
-                if(g_idot && e->g.fmt==2 && e->u.fmt==2 && e->g.I==e->u.I && e->g.O==e->u.O){
+                if(g_idot && e->g.fmt==4 && e->u.fmt==4 && e->g.I==e->u.I && e->g.O==e->u.O){
+                    matmul_i2_idot_pair(gg,uu,xg,e->g.q4,e->g.s,e->u.q4,e->u.s,nr,e->g.I,e->g.O);
+                } else if(g_idot && e->g.fmt==2 && e->u.fmt==2 && e->g.I==e->u.I && e->g.O==e->u.O){
                     matmul_i4_idot_pair(gg,uu,xg,e->g.q4,e->g.s,e->u.q4,e->u.s,nr,e->g.I,e->g.O);
                 } else if(g_idot && e->g.fmt==1 && e->u.fmt==1 && e->g.I==e->u.I && e->g.O==e->u.O){
                     matmul_q_idot_pair(gg,uu,xg,e->g.q8,e->g.s,e->u.q8,e->u.s,nr,e->g.I,e->g.O);
@@ -2080,7 +2220,8 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
                           s=tier_lfru_score(m->eheat[layer][Sl[z].eid],m->elast[layer][Sl[z].eid],m->eaccess_clock);
                       if(s<worst){ worst=s; lru=z; } }
                   dst=&Sl[lru]; }
-              ESlot tmp=*dst; *dst=m->ws[q]; m->ws[q]=tmp; dst->used=++m->eclock; }
+              ESlot tmp=*dst; *dst=m->ws[q]; m->ws[q]=tmp; dst->used=++m->eclock;
+              if(g_int2_ecache) expert_shrink_to_int2(m, dst); }
         }
     }
     float *sg=falloc((int64_t)S*sI), *su=falloc((int64_t)S*sI);
@@ -3052,7 +3193,8 @@ int main(int argc, char **argv){
     g_direct=getenv("DIRECT")?atoi(getenv("DIRECT")):1;
     g_idot=getenv("IDOT")?atoi(getenv("IDOT")):1;
     g_i4s=getenv("I4S")?atoi(getenv("I4S")):g_i4s;
-    g_i8slab=getenv("I8SLAB")?atoi(getenv("I8SLAB")):0;  /* I8SLAB=1: pre-dequant to int8 (3├ù RAM, faster matmul) */
+    g_i8slab=getenv("I8SLAB")?atoi(getenv("I8SLAB")):0;
+    g_int2_ecache=getenv("INT2_ECACHE")?atoi(getenv("INT2_ECACHE")):0;  /* I8SLAB=1: pre-dequant to int8 (3├ù RAM, faster matmul) */
     g_pipe=getenv("PIPE")?atoi(getenv("PIPE")):
 #ifdef _WIN32
         1
