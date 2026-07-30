@@ -2042,7 +2042,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
             for(int r=0;r<nr;r++) memcpy(xg+(int64_t)r*D,x+(int64_t)rows[r]*D,D*sizeof(float));
             double t0=now_s();
 #ifdef COLI_CUDA
-            if(g_cuda_enabled && !gpu_call && !omp_in_parallel() &&
+            if(g_cuda_enabled && !gpu_call && nr>=4 && !omp_in_parallel() &&
                expert_gpu_stage_compute(hh,xg,e,nr,g_cuda_devices[0])){
                 m->gpu_expert_calls++;
             } else
@@ -2262,7 +2262,7 @@ static int mtp_draft(Model *m, int next_tok, int kv, int G, int *draft){
     float *row=falloc(D), *logit=falloc(c->vocab), *h=falloc(D);
     memcpy(h,m->hlast,D*sizeof(float));
     int tok=next_tok, n=0;
-    int prenorm=getenv("MTP_PRENORM")?atoi(getenv("MTP_PRENORM")):1;
+    int prenorm=getenv("MTP_PRENORM")?atoi(getenv("MTP_PRENORM")):0;
     for(int g=0;g<G;g++){
         int pos=p+g; if(pos+2>=m->max_t) break;
         embed_row(m,tok,x);
@@ -2296,7 +2296,7 @@ static void mtp_absorb(Model *m, const int *next_ids, const float *x, int S, int
     Cfg *c=&m->c; int D=c->hidden, li=c->n_layers;
     if(m->kv_start[li]<0||m->kv_start[li]>pos_base) m->kv_start[li]=pos_base;
     float *hx=falloc((int64_t)S*D), *cat=falloc(2*D), *e=falloc(D), *hn=falloc(D), *hf=falloc(D);
-    int prenorm=getenv("MTP_PRENORM")?atoi(getenv("MTP_PRENORM")):1;
+    int prenorm=getenv("MTP_PRENORM")?atoi(getenv("MTP_PRENORM")):0;
     for(int i=0;i<S;i++){
         embed_row(m,next_ids[i],e);
         rmsnorm(e,e,m->enorm,D,c->eps);
