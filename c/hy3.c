@@ -397,6 +397,8 @@ static int g_prefetch=0;  /* PREFETCH=1: cross-layer expert preload via backgrou
 #ifdef _WIN32
 static DWORD_PTR g_e_mask=0;  /* E-core affinity mask for background threads */
 #endif
+static int g_expert_budget=0; /* EXPERT_BUDGET=N: cap distinct experts per layer (decode only, S<=4) */
+static int64_t g_budget_dropped=0; /* total experts dropped by EXPERT_BUDGET */
 static int g_cache_route=1;  /* CACHE_ROUTE=1: cache-aware routing (max-rank, arXiv 2412.00099) */
 static int g_route_j=2;      /* ROUTE_J: sacred top ranks (always take, even uncached) */
 static int g_route_m=18;     /* ROUTE_M: max-rank window for cache-preferring fill */
@@ -476,7 +478,24 @@ static inline int32_t dot_i8i8(const int8_t *w, const int8_t *x, int I){
 }
 static inline int32_t dot_i4i8(const uint8_t *w4, const int8_t *x, int I){
     int32_t sum=0; int i=0;
-#if defined(__AVXVNNI__) && defined(__AVX2__)
+#if defined(__AVX2__) && !defined(DOT_VNNI)
+    /* AVX2 256-bit: more elements per dispatch, more shuffle throughput for int4 unpacking */
+    const __m128i m4=_mm_set1_epi8(0x0F); const __m256i b8=_mm256_set1_epi8(8);
+    const __m256i ones=_mm256_set1_epi16(1);
+    __m256i acc=_mm256_setzero_si256();
+    for(;i+32<=I;i+=32){
+        __m128i by=_mm_loadu_si128((const __m128i*)(w4+(i>>1)));
+        __m128i lo=_mm_and_si128(by,m4), hi=_mm_and_si128(_mm_srli_epi16(by,4),m4);
+        __m128i n0=_mm_unpacklo_epi8(lo,hi), n1=_mm_unpackhi_epi8(lo,hi);
+        __m256i wv=_mm256_sub_epi8(_mm256_set_m128i(n1,n0),b8);
+        __m256i xv=_mm256_loadu_si256((const __m256i*)(x+i));
+        __m256i p=_mm256_maddubs_epi16(_mm256_sign_epi8(wv,wv),_mm256_sign_epi8(xv,wv));
+        acc=_mm256_add_epi32(acc,_mm256_madd_epi16(p,ones));
+    }
+    sum=hsum256_i32(acc);
+    for(;i<I;i++){ uint8_t b=w4[i>>1]; sum+=((int)((b>>((i&1)*4))&0xF)-8)*x[i]; }
+#elif defined(__AVXVNNI__) && defined(__AVX2__) && defined(DOT_VNNI)
+    /* AVX-VNNI 128-bit: single-uop VPDPBUSD, best for port-0-bound matmul */
     const __m128i m4=_mm_set1_epi8(0x0F); const __m128i b8=_mm_set1_epi8(8);
     __m128i a0=_mm_setzero_si128(),a1=_mm_setzero_si128(),a2=_mm_setzero_si128(),a3=_mm_setzero_si128();
     for(;i+64<=I;i+=64){
@@ -504,22 +523,6 @@ static inline int32_t dot_i4i8(const uint8_t *w4, const int8_t *x, int I){
         acc=_mm_dpbusd_epi32(acc,_mm_abs_epi8(w1),_mm_sign_epi8(x1,w1));
     }
     sum=hsum128_i32(acc);
-    for(;i<I;i++){ uint8_t b=w4[i>>1]; sum+=((int)((b>>((i&1)*4))&0xF)-8)*x[i]; }
-#elif defined(__AVX2__)
-    const __m128i m4=_mm_set1_epi8(0x0F); const __m256i b8=_mm256_set1_epi8(8);
-    const __m256i ones=_mm256_set1_epi16(1);
-    __m256i acc=_mm256_setzero_si256();
-    for(;i+32<=I;i+=32){
-        __m128i by=_mm_loadu_si128((const __m128i*)(w4+(i>>1)));
-        __m128i lo=_mm_and_si128(by,m4), hi=_mm_and_si128(_mm_srli_epi16(by,4),m4);
-        __m128i n0=_mm_unpacklo_epi8(lo,hi), n1=_mm_unpackhi_epi8(lo,hi);
-        __m256i wv=_mm256_sub_epi8(_mm256_set_m128i(n1,n0),b8);
-        __m256i xv=_mm256_loadu_si256((const __m256i*)(x+i));
-        __m256i p=_mm256_maddubs_epi16(_mm256_sign_epi8(wv,wv),_mm256_sign_epi8(xv,wv));
-        acc=_mm256_add_epi32(acc,_mm256_madd_epi16(p,ones));
-    }
-    sum=hsum256_i32(acc);
-    for(;i<I;i++){ uint8_t b=w4[i>>1]; sum+=((int)((b>>((i&1)*4))&0xF)-8)*x[i]; }
 #elif defined(__ARM_NEON)
     const uint8x16_t m4q=vdupq_n_u8(0x0F); const int8x16_t b8q=vdupq_n_s8(8);
 #if defined(__ARM_FEATURE_DOTPROD)
@@ -694,6 +697,30 @@ static void matmul_i4_idot_pair(float *yg, float *yu, const float *x,
     }
 }
 
+/* 2-way unrolled: two output rows, shared xq load. Shaves ~15% on memory-bound matmuls. */
+static void matmul_i4_idot_2way(float *y, const int8_t *xq, const float *sx,
+                                const uint8_t *q4, const float *scale,
+                                int S, int I, int O){
+    int rb=(I+1)/2; int odd=O&1; O&=~1;
+    #pragma omp parallel for schedule(static)
+    for(int o=0;o<O;o+=2){
+        const uint8_t *w0=q4+(int64_t)(o+0)*rb, *w1=q4+(int64_t)(o+1)*rb;
+        float sc0=scale[o+0], sc1=scale[o+1];
+        for(int s=0;s<S;s++){
+            const int8_t *xs=xq+(int64_t)s*I;
+            y[(int64_t)s*(O+odd)+o+0]=(float)dot_i4i8(w0,xs,I)*sc0*sx[s];
+            y[(int64_t)s*(O+odd)+o+1]=(float)dot_i4i8(w1,xs,I)*sc1*sx[s];
+        }
+    }
+    if(odd){
+        int o=O; const uint8_t *w0=q4+(int64_t)o*rb; float sc0=scale[o];
+        for(int s=0;s<S;s++){
+            const int8_t *xs=xq+(int64_t)s*I;
+            y[(int64_t)s*(O+1)+o]=(float)dot_i4i8(w0,xs,I)*sc0*sx[s];
+        }
+    }
+}
+
 /* Same fusion for int2 weights (fmt==4, shrunk ecache) */
 static void matmul_i2_idot_pair(float *yg, float *yu, const float *x,
                                const uint8_t *qg, const float *sg,
@@ -753,6 +780,7 @@ static void matmul_qt(float *y, const float *x, QT *w, int S){
         for(int s=0;s<S;s++) sx[s]=qrow_i8(x+(int64_t)s*I,xq+(int64_t)s*I,I);
         if(w->fmt==1) matmul_q_idot(y,xq,sx,w->q8,w->s,S,I,w->O);
         else if(w->fmt==4) matmul_i2_idot(y,xq,sx,w->q4,w->s,S,I,w->O);
+        else if(w->O>=2) matmul_i4_idot_2way(y,xq,sx,w->q4,w->s,S,I,w->O);
         else matmul_i4_idot(y,xq,sx,w->q4,w->s,S,I,w->O);
         return;
     }
@@ -2137,6 +2165,55 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
     for(int s=0;s<S;s++) for(int kk=0;kk<keff[s];kk++){
         int e=idxs[(int64_t)s*K+kk]; if(!seen[e]){ seen[e]=1; uniq[nu++]=e; }
     }
+    /* EXPERT_BUDGET: cap distinct experts per layer (decode only, S<=4). Always keeps
+     * cache hits (pin/LRU — no disk I/O). From misses, keeps the highest-weight ones
+     * up to the budget. Remaining dropped from routing. */
+    if(g_expert_budget>0 && S<=4 && nu>g_expert_budget){
+        float *wsum=falloc(nu); for(int j=0;j<nu;j++) wsum[j]=0;
+        for(int s=0;s<S;s++) for(int kk=0;kk<keff[s];kk++){
+            int e=idxs[(int64_t)s*K+kk];
+            for(int j=0;j<nu;j++) if(uniq[j]==e){ wsum[j]+=ws[(int64_t)s*K+kk]; break; }
+        }
+        unsigned char *is_hit=calloc(nu,1); int nhits=0;
+        for(int j=0;j<nu;j++){ int eid=uniq[j];
+            int found=0;
+            ESlot *P=m->pin[layer];
+            for(int z=0;z<m->npin[layer];z++) if(P[z].eid==eid){ found=1; break; }
+            if(!found){ ESlot *Sl=m->ecache[layer]; int nn=m->ecn[layer];
+                for(int z=0;z<nn;z++) if(Sl[z].eid==eid){ found=1; break; } }
+            if(found){ is_hit[j]=1; nhits++; }
+        }
+        int miss_budget=g_expert_budget-nhits; if(miss_budget<0) miss_budget=0;
+        unsigned char *keep=calloc(nu,1); int nkeep=0;
+        for(int j=0;j<nu;j++) if(is_hit[j]){ keep[j]=1; nkeep++; }
+        for(int rank=0;rank<miss_budget;rank++){
+            int best=-1; float bv=-1e30f;
+            for(int j=0;j<nu;j++) if(!keep[j] && wsum[j]>bv){ bv=wsum[j]; best=j; }
+            if(best<0) break; keep[best]=1; nkeep++;
+        }
+        memset(seen,0,(size_t)E);
+        for(int j=0;j<nu;j++) if(keep[j]) seen[uniq[j]]=1;
+        int dropped=nu-nkeep; g_budget_dropped+=dropped;
+        for(int s=0;s<S;s++){
+            int w=0;
+            for(int kk=0;kk<keff[s];kk++){
+                int e=idxs[(int64_t)s*K+kk];
+                if(seen[e]){ idxs[(int64_t)s*K+w]=e; ws[(int64_t)s*K+w]=ws[(int64_t)s*K+kk]; w++; }
+            }
+            if(w<keff[s]){
+                keff[s]=w;
+                if(c->route_norm && w>0){
+                    float sm=0; for(int kk=0;kk<w;kk++) sm+=ws[(int64_t)s*K+kk]; sm+=1e-20f;
+                    for(int kk=0;kk<w;kk++) ws[(int64_t)s*K+kk]/=sm;
+                    for(int kk=0;kk<w;kk++) ws[(int64_t)s*K+kk]*=c->router_scale;
+                }
+            }
+        }
+        int nu2=0;
+        for(int j=0;j<nu;j++) if(keep[j]) uniq[nu2++]=uniq[j];
+        nu=nu2;
+        free(wsum); free(is_hit); free(keep);
+    }
     float *xg=falloc((int64_t)S*D), *gg=falloc((int64_t)S*I), *uu=falloc((int64_t)S*I), *hh=falloc((int64_t)S*D);
     int *rows=malloc(S*sizeof(int)); float *rw=malloc(S*sizeof(float));
     for(int base=0;base<nu;base+=64){
@@ -2888,6 +2965,10 @@ static void profile_print(Model *m, double elapsed){
         printf("  PILOT: %ld speculative loads / %ld drops (recall %.1f%%)\n",
             loads,drops,loads+drops>0?100.0*loads/(loads+drops):0.0);
     }
+    if(g_expert_budget>0){
+        printf("  EXPERT_BUDGET=%d: dropped %lld experts (saved ~%.1f GB I/O)\n",
+            g_expert_budget,(long long)g_budget_dropped,g_budget_dropped*18.9e6/1e9);
+    }
 }
 
 static void perf_report(Model *m){
@@ -3221,6 +3302,8 @@ int main(int argc, char **argv){
     if(g_pilot_k<1) g_pilot_k=1;
     g_pilot_evict_guard=getenv("PILOT_EVICT_GUARD")?atoi(getenv("PILOT_EVICT_GUARD")):1;
     if(g_pilot) fprintf(stderr,"[PILOT] on K=%d real=%d (router-lookahead prefetch)\n",g_pilot_k,g_pilot_real);
+    g_expert_budget=getenv("EXPERT_BUDGET")?atoi(getenv("EXPERT_BUDGET")):0;
+    if(g_expert_budget>0) fprintf(stderr,"[EXPERT_BUDGET=%d] capping distinct experts per decode layer\n",g_expert_budget);
     g_cache_route=getenv("CACHE_ROUTE")?atoi(getenv("CACHE_ROUTE")):1;
     g_route_j=getenv("ROUTE_J")?atoi(getenv("ROUTE_J")):2;
     g_route_m=getenv("ROUTE_M")?atoi(getenv("ROUTE_M")):18;
