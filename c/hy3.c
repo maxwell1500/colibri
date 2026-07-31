@@ -402,12 +402,8 @@ static int64_t g_budget_dropped=0; /* total experts dropped by EXPERT_BUDGET */
 /* NN_SUB: nearest-neighbor expert substitution. At miss time, if a cached expert
  * is similar enough (cosine > threshold), warm, and position-compatible, substitute
  * it for the missing expert — turning a disk load into a free cache hit. */
-static int g_nn_sub=0;        /* NN_SUB=1: enable NN substitution */
-static float g_nn_thresh=0.95f; /* NN_THRESH: cosine similarity cutoff */
-static int8_t *g_nn_centroid=NULL; /* [n_layers*n_experts*nn_D] int8 centroids */
-static int g_nn_D=0;          /* centroid dimension (truncated hidden) */
-static int *g_nn_idx=NULL;    /* [n_layers*n_experts*3] neighbor expert ids (local to layer) */
-static float *g_nn_score=NULL;/* [n_layers*n_experts*3] cosine scores */
+static int g_nn_sub=0;        /* NN_SUB=1: enable NN substitution via router score proximity */
+static float g_nn_ratio=0.05f; /* NN_RATIO: max score ratio deviation for substitution */
 static int64_t g_nn_substituted=0, g_nn_attempted=0;
 static int g_cache_route=1;  /* CACHE_ROUTE=1: cache-aware routing (max-rank, arXiv 2412.00099) */
 static int g_route_j=2;      /* ROUTE_J: sacred top ranks (always take, even uncached) */
@@ -1261,112 +1257,10 @@ static int expert_load(Model *m, int layer, int eid, ESlot *s){
     return 1;
 }
 
-/* NN_SUB: compute per-expert centroids from gate_proj weights, build top-3 NN graph.
- * Centroid = row-mean of gate_proj, quantized to int8, truncated to nn_D dimensions.
- * Reads only gate_proj (not full expert) to minimize startup I/O. */
-static void nn_init(Model *m){
-    if(!g_nn_sub) return;
-    Cfg *c=&m->c; int D=c->hidden, E=c->n_experts;
-    int I=c->moe_inter;
-    int nn_D=g_nn_D>0?g_nn_D:(D<512?D:512);  /* truncate large hidden dims */
-    g_nn_D=nn_D;
-    int total=c->n_layers*E;
-    /* Allocate centroid + graph arrays */
-    g_nn_centroid=calloc((size_t)total*(size_t)nn_D,sizeof(int8_t));
-    g_nn_idx=calloc((size_t)total*(size_t)3,sizeof(int));
-    g_nn_score=calloc((size_t)total*(size_t)3,sizeof(float));
-    if(!g_nn_centroid||!g_nn_idx||!g_nn_score){fprintf(stderr,"OOM nn_init\n");exit(1);}
-    fprintf(stderr,"[NN_SUB] computing centroids: %d layers x %d experts, D=%d -> %d\n",c->n_layers,E,D,nn_D);
-    /* Read only gate_proj per expert (not full 3-tensor expert) */
-    QT gt; char nm[288];
-    for(int layer=0;layer<c->n_layers;layer++){
-        for(int eid=0;eid<E;eid++){
-            snprintf(nm,sizeof(nm),"model.layers.%d.mlp.experts.%d.gate_proj.weight",layer,eid);
-            memset(&gt,0,sizeof(gt));
-            qt_from_disk(m,nm,I,D,m->ebits,1,&gt);  /* drop=1: fadvise DONTNEED after read */
-            /* Centroid = mean of first nn_D rows of gate_proj (shape [I,D]) */
-            if(gt.fmt==2 && gt.q4){
-                const uint8_t *q4=gt.q4;
-                float sc=gt.s[0];
-                int rb=(gt.I+1)/2;
-                for(int d=0;d<nn_D;d++){
-                    int32_t sum=0;
-                    for(int r=0;r<gt.O;r++){
-                        const uint8_t *row=q4+(int64_t)r*rb;
-                        int vi=r*(rb/2)+d/2;
-                        uint8_t nib=(row[vi]>>(4*(vi&1)))&0xF;
-                        sum+=(int32_t)(nib-8);
-                    }
-                    float mean=(float)sum/(float)gt.O;
-                    float vq=mean/sc;
-                    if(vq>127.f)vq=127.f; if(vq<-127.f)vq=-127.f;
-                    g_nn_centroid[(int64_t)(layer*E+eid)*nn_D+d]=(int8_t)lrintf(vq);
-                }
-            } else if(gt.fmt==1 && gt.q8){
-                float sc=gt.s[0];
-                for(int d=0;d<nn_D;d++){
-                    int32_t sum=0;
-                    for(int r=0;r<gt.O;r++) sum+=(int32_t)gt.q8[(int64_t)r*gt.I+d];
-                    float mean=(float)sum/(float)gt.O;
-                    float vq=mean/sc;
-                    if(vq>127.f)vq=127.f; if(vq<-127.f)vq=-127.f;
-                    g_nn_centroid[(int64_t)(layer*E+eid)*nn_D+d]=(int8_t)lrintf(vq);
-                }
-            }
-            free(gt.q4); free(gt.q8); free(gt.s);
-        }
-    }
-    /* Build top-3 NN graph per expert (cosine similarity of int8 centroids).
-     * Only compare within the same layer — substitution is intra-layer only. */
-    fprintf(stderr,"[NN_SUB] building NN graph (%d experts total)\n",total);
-    for(int layer=0;layer<c->n_layers;layer++){
-        int base=layer*E;
-        for(int ei=0;ei<E;ei++){
-            int i=base+ei;
-            const int8_t *ci=g_nn_centroid+(int64_t)i*nn_D;
-            float ni=0; for(int d=0;d<nn_D;d++) ni+=(float)ci[d]*ci[d]; ni=sqrtf(ni);
-            if(ni<1e-6f) continue;
-            for(int n=0;n<3;n++){ g_nn_idx[i*3+n]=-1; g_nn_score[i*3+n]=-1.f; }
-            for(int ej=ei+1;ej<E;ej++){
-                int j=base+ej;
-                const int8_t *cj=g_nn_centroid+(int64_t)j*nn_D;
-                float dot=0; for(int d=0;d<nn_D;d++) dot+=(float)ci[d]*cj[d];
-                float nj=0; for(int d=0;d<nn_D;d++) nj+=(float)cj[d]*cj[d]; nj=sqrtf(nj);
-                if(nj<1e-6f) continue;
-                float cos=dot/(ni*nj);
-                int slot=-1;
-                for(int s=0;s<3;s++){
-                    if(g_nn_idx[i*3+s]<0||cos>g_nn_score[i*3+s]){slot=s;break;}
-                }
-                if(slot>=0){
-                    if(slot<2&&g_nn_idx[i*3+2]>=0){ g_nn_idx[i*3+2]=g_nn_idx[i*3+1]; g_nn_score[i*3+2]=g_nn_score[i*3+1]; }
-                    if(slot<1&&g_nn_idx[i*3+1]>=0){ g_nn_idx[i*3+1]=g_nn_idx[i*3+0]; g_nn_score[i*3+1]=g_nn_score[i*3+0]; }
-                    g_nn_idx[i*3+slot]=ej; g_nn_score[i*3+slot]=cos;
-                }
-            }
-            /* Symmetric: check if any earlier expert in this layer listed us */
-            for(int ej=0;ej<ei;ej++){
-                int j=base+ej;
-                if(g_nn_idx[j*3+0]<0) continue;
-                int found=0;
-                for(int s=0;s<3;s++) if(g_nn_idx[j*3+s]==ei){found=1;break;}
-                if(!found) continue;
-                float cos=g_nn_score[j*3+0];
-                int slot=-1;
-                for(int s=0;s<3;s++){
-                    if(g_nn_idx[i*3+s]<0||cos>g_nn_score[i*3+s]){slot=s;break;}
-                }
-                if(slot>=0){
-                    if(slot<2&&g_nn_idx[i*3+2]>=0){ g_nn_idx[i*3+2]=g_nn_idx[i*3+1]; g_nn_score[i*3+2]=g_nn_score[i*3+1]; }
-                    if(slot<1&&g_nn_idx[i*3+1]>=0){ g_nn_idx[i*3+1]=g_nn_idx[i*3+0]; g_nn_score[i*3+1]=g_nn_score[i*3+0]; }
-                    g_nn_idx[i*3+slot]=ej; g_nn_score[i*3+slot]=cos;
-                }
-            }
-        }
-    }
-    fprintf(stderr,"[NN_SUB] ready (centroids: %.1f MB, graph: %.1f MB)\n",
-        (double)total*nn_D/1048576.,(double)total*6*(sizeof(int)+sizeof(float))/1048576.);
-}
+/* NN_SUB: compare router logit scores. If a missing expert's score is within
+ * NN_RATIO of a cached expert's score, the cached one is a near-equivalent
+ * substitute — no I/O needed. Router scores are already computed in moe(). */
+static void nn_init(Model *m){ (void)m; }
 
 static int g_pipe=0, g_pipe_nw=8, g_pipe_block=0;
 
@@ -2193,6 +2087,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
     Cfg *c=&m->c; int D=c->hidden, E=c->n_experts, K=c->topk, I=c->moe_inter;
     int sI=c->moe_inter*c->n_shared;
     float *logit=falloc(E), *choice=falloc(E);
+    float *nn_logit=NULL; if(g_nn_sub && S<=4 && l->sparse) nn_logit=falloc((int64_t)S*E);
     int *idxs=malloc((size_t)S*K*sizeof(int)); float *ws=malloc((size_t)S*K*sizeof(float));
     int *keff=malloc(S*sizeof(int));
     uint8_t *warm_tier=NULL;
@@ -2331,68 +2226,50 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
         nu=nu2;
         free(wsum); free(is_hit); free(keep);
     }
-    /* NN_SUB: for each non-resident unique expert, try substituting with a warm
-     * cached neighbor whose centroid cosine > threshold. This turns disk misses
-     * into free cache hits without any I/O. */
-    if(g_nn_sub&&g_nn_centroid){
-        int ti=layer*m->c.n_experts;  /* global index offset for this layer */
-        unsigned char *nn_ok=calloc(nu,1);  /* 1=substituted, 0=keep original */
+    /* NN_SUB: uses per-position router logits saved during routing.
+     * For each non-resident expert, checks if any cached expert had a score
+     * within NN_RATIO — if so, substitutes (free cache hit). */
+    if(g_nn_sub && S<=4 && l->sparse && nn_logit){
         for(int j=0;j<nu;j++){
-            int eid=uniq[j];
-            /* Check if resident */
-            int found=0;
+            int eid=uniq[j]; int found=0;
             ESlot *P=m->pin[layer];
             for(int z=0;z<m->npin[layer];z++) if(P[z].eid==eid){found=1;break;}
             if(!found){ ESlot *Sl=m->ecache[layer]; int nn=m->ecn[layer];
                 for(int z=0;z<nn;z++) if(Sl[z].eid==eid){found=1;break;} }
-            if(found) continue;  /* already resident, no substitution needed */
-            /* Try NN neighbors */
-            int gi=ti+eid;
-            const int8_t *ci=g_nn_centroid+(int64_t)gi*g_nn_D;
-            float ni=0; for(int d=0;d<g_nn_D;d++) ni+=(float)ci[d]*ci[d]; ni=sqrtf(ni);
-            if(ni<1e-6f) continue;
+            if(found) continue;
             g_nn_attempted++;
-            for(int n=0;n<3;n++){
-                int nei=g_nn_idx[gi*3+n];
-                if(nei<0) break;
-                float cos=g_nn_score[gi*3+n];
-                if(cos<g_nn_thresh) continue;
-                /* Check if neighbor is resident AND warm */
-                int nfound=0;
+            int sub=0;
+            for(int s=0;s<S;s++){
+                int has=0;
+                for(int kk=0;kk<keff[s];kk++) if(idxs[(int64_t)s*K+kk]==eid){has=1;break;}
+                if(!has) continue;
+                float ms=nn_logit[(int64_t)s*E+eid];
+                int best=-1; float best_r=1e30f;
                 ESlot *P2=m->pin[layer];
-                for(int z=0;z<m->npin[layer];z++) if(P2[z].eid==nei){nfound=1;break;}
-                if(!nfound){ ESlot *Sl=m->ecache[layer]; int nn2=m->ecn[layer];
-                    for(int z=0;z<nn2;z++) if(Sl[z].eid==nei){nfound=1;break;} }
-                if(!nfound) continue;
-                /* Check warmth: heat above median for this layer */
-                if(m->eheat[layer]){
-                    uint32_t median=0;
-                    uint32_t heap[256]; int hn=0;
-                    for(int e=0;e<m->c.n_experts&&hn<256;e++){
-                        uint32_t h=m->eheat[layer][e];
-                        if(h==0) continue;
-                        heap[hn++]=h;
-                    }
-                    if(hn>=2) {
-                        /* Quick median estimate from sample */
-                        for(int a=0;a<hn;a++) for(int b=a+1;b<hn;b++)
-                            if(heap[b]<heap[a]){uint32_t t=heap[a];heap[a]=heap[b];heap[b]=t;}
-                        median=heap[hn/2];
-                    }
-                    if(m->eheat[layer][nei]<median) continue;  /* cold neighbor, skip */
+                for(int z=0;z<m->npin[layer];z++){
+                    int ceid=P2[z].eid; if(ceid==eid) continue;
+                    float cs=nn_logit[(int64_t)s*E+ceid];
+                    float r=fabsf(cs-ms)/(fabsf(ms)+1e-20f);
+                    if(r<g_nn_ratio && r<best_r){best_r=r;best=ceid;}
                 }
-                /* Substitute */
-                nn_ok[j]=1; g_nn_substituted++;
-                /* Rewrite all references to eid → nei in idxs/ws/keff */
-                for(int s=0;s<S;s++) for(int kk=0;kk<keff[s];kk++){
-                    int pos=(int64_t)s*K+kk;
-                    if(idxs[pos]==eid){ idxs[pos]=nei; }
+                if(best<0){ ESlot *Sl=m->ecache[layer]; int nn=m->ecn[layer];
+                    for(int z=0;z<nn;z++){
+                        int ceid=Sl[z].eid; if(ceid==eid) continue;
+                        float cs=nn_logit[(int64_t)s*E+ceid];
+                        float r=fabsf(cs-ms)/(fabsf(ms)+1e-20f);
+                        if(r<g_nn_ratio && r<best_r){best_r=r;best=ceid;}
+                    }
                 }
-                break;  /* one substitution per expert is enough */
+                if(best>=0){ sub=1;
+                    for(int sk=0;sk<keff[s];sk++)
+                        if(idxs[(int64_t)s*K+sk]==eid) idxs[(int64_t)s*K+sk]=best;
+                }
             }
+            if(sub) g_nn_substituted++;
         }
-        free(nn_ok);
+        free(nn_logit); nn_logit=NULL;
     }
+
     float *xg=falloc((int64_t)S*D), *gg=falloc((int64_t)S*I), *uu=falloc((int64_t)S*I), *hh=falloc((int64_t)S*D);
     int *rows=malloc(S*sizeof(int)); float *rw=malloc(S*sizeof(float));
     for(int base=0;base<nu;base+=64){
@@ -3490,8 +3367,8 @@ int main(int argc, char **argv){
     g_expert_budget=getenv("EXPERT_BUDGET")?atoi(getenv("EXPERT_BUDGET")):0;
     if(g_expert_budget>0) fprintf(stderr,"[EXPERT_BUDGET=%d] capping distinct experts per decode layer\n",g_expert_budget);
     g_nn_sub=getenv("NN_SUB")?atoi(getenv("NN_SUB")):0;
-    g_nn_thresh=getenv("NN_THRESH")?atof(getenv("NN_THRESH")):0.95f;
-    if(g_nn_sub) fprintf(stderr,"[NN_SUB] on (thresh=%.2f)\n",g_nn_thresh);
+    g_nn_ratio=getenv("NN_RATIO")?atof(getenv("NN_RATIO")):0.05f;
+    if(g_nn_sub) fprintf(stderr,"[NN_SUB] on (ratio=%.3f — substitute if router score within %.1f%%)\n",g_nn_ratio,g_nn_ratio*100);
     g_cache_route=getenv("CACHE_ROUTE")?atoi(getenv("CACHE_ROUTE")):1;
     g_route_j=getenv("ROUTE_J")?atoi(getenv("ROUTE_J")):2;
     g_route_m=getenv("ROUTE_M")?atoi(getenv("ROUTE_M")):18;
